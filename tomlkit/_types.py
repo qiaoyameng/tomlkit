@@ -8,6 +8,7 @@ from typing import TypeVar
 WT = TypeVar("WT", bound="WrapperType")
 
 __all__ = [
+    "_CustomDecimal",
     "_CustomDict",
     "_CustomFloat",
     "_CustomInt",
@@ -16,6 +17,8 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:  # pragma: no cover
+    from decimal import Decimal as _CustomDecimal
+
     # Define _CustomList and _CustomDict as a workaround for:
     # https://github.com/python/mypy/issues/11427
     #
@@ -42,10 +45,15 @@ if TYPE_CHECKING:  # pragma: no cover
         def _new(self: WT, value: Any) -> WT: ...
 
 else:
+    import decimal
+
     from collections.abc import MutableMapping
     from collections.abc import MutableSequence
     from numbers import Integral
     from numbers import Real
+
+    class _CustomDecimal(decimal.Decimal):
+        """Adds nothing but the ability to subclass decimal.Decimal"""
 
     class _CustomList(MutableSequence, list):
         """Adds MutableSequence mixin while pretending to be a builtin list"""

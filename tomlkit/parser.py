@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import decimal
 import re
 import string
 
@@ -32,6 +33,7 @@ from tomlkit.items import BoolType
 from tomlkit.items import Comment
 from tomlkit.items import Date
 from tomlkit.items import DateTime
+from tomlkit.items import Decimal
 from tomlkit.items import Float
 from tomlkit.items import InlineTable
 from tomlkit.items import Integer
@@ -100,9 +102,15 @@ class Parser:
     # adds a level of nested containers. Refuse documents beyond this depth.
     MAX_NESTING_DEPTH = 100
 
-    def __init__(self, string: str | bytes) -> None:
+    def __init__(
+        self, string: str | bytes, parse_float: Callable[[str], Any] = float
+    ) -> None:
         # Input to parse
         self._src = Source(decode(string))
+
+        # Callable used to convert TOML float literals (e.g. ``decimal.Decimal``
+        # for an exact, context-independent decimal mode)
+        self._parse_float = parse_float
 
         self._aot_stack: list[Key] = []
         self._nesting_depth = 0
@@ -794,9 +802,14 @@ class Parser:
         # ValueError above; it must be rejected, not silently coerced to inf.
         if base == 10 and ("." in clean or "e" in clean or clean in ("inf", "nan")):
             try:
-                return Float(float(sign + clean), trivia, sign + raw)
-            except ValueError:
+                value = self._parse_float(sign + clean)
+            except (ValueError, ArithmeticError):
                 return None
+
+            if isinstance(value, decimal.Decimal):
+                return Decimal(value, trivia, sign + raw)
+
+            return Float(value, trivia, sign + raw)
 
         return None
 

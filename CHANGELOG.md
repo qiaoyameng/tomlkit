@@ -1,5 +1,11 @@
 # Change Log
 
+## [Unreleased]
+
+### Added
+
+- Add an optional decimal numeric mode: `parse()`, `loads()` and `load()` now accept a `parse_float` callable (mirroring `tomllib`). Passing `decimal.Decimal` exposes TOML floats as exact `Decimal` values at the semantic layer — unaffected by the active decimal context's precision — while unmodified values keep their original lexemes (exponents, signs, underscores). New `Decimal` values assigned to documents are written as valid TOML float literals (integral values gain a trailing `.0`; non-finite values use `inf`/`nan`), and a new `tomlkit.items.Decimal` item type supports arithmetic that re-serializes under the same rules.
+
 ## [0.15.1] - 2026-07-17
 
 ### Changed

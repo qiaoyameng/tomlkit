@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import datetime as _datetime
 
+from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Mapping
 from typing import IO
@@ -44,13 +45,15 @@ if TYPE_CHECKING:
     E = TypeVar("E", bound=Encoder)
 
 
-def loads(string: str | bytes) -> TOMLDocument:
+def loads(
+    string: str | bytes, parse_float: Callable[[str], Any] = float
+) -> TOMLDocument:
     """
     Parses a string into a TOMLDocument.
 
     Alias for parse().
     """
-    return parse(string)
+    return parse(string, parse_float=parse_float)
 
 
 def dumps(data: Mapping[str, Any], sort_keys: bool = False) -> str:
@@ -77,11 +80,13 @@ def dumps(data: Mapping[str, Any], sort_keys: bool = False) -> str:
         raise TypeError(msg) from ex
 
 
-def load(fp: IO[str] | IO[bytes]) -> TOMLDocument:
+def load(
+    fp: IO[str] | IO[bytes], parse_float: Callable[[str], Any] = float
+) -> TOMLDocument:
     """
     Load toml document from a file-like object.
     """
-    return parse(fp.read())
+    return parse(fp.read(), parse_float=parse_float)
 
 
 def dump(data: Mapping[str, Any], fp: IO[str], *, sort_keys: bool = False) -> None:
@@ -99,11 +104,18 @@ def dump(data: Mapping[str, Any], fp: IO[str], *, sort_keys: bool = False) -> No
     fp.write(dumps(data, sort_keys=sort_keys))
 
 
-def parse(string: str | bytes) -> TOMLDocument:
+def parse(
+    string: str | bytes, parse_float: Callable[[str], Any] = float
+) -> TOMLDocument:
     """
     Parses a string or bytes into a TOMLDocument.
+
+    :param parse_float: callable used to convert TOML float literals into
+        Python objects. Pass ``decimal.Decimal`` to expose floats as exact
+        decimals whose precision is not affected by the active decimal
+        context; unmodified values keep their original textual form.
     """
-    return Parser(string).parse()
+    return Parser(string, parse_float=parse_float).parse()
 
 
 def document() -> TOMLDocument:
