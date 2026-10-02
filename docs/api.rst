@@ -46,3 +46,11 @@ TOML Exceptions
 .. automodule:: tomlkit.exceptions
    :members:
    :show-inheritance:
+
+
+Recovery Parsing
+----------------
+
+.. automodule:: tomlkit.recovery
+   :members:
+   :show-inheritance:

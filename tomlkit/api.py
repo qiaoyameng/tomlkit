@@ -35,6 +35,7 @@ from tomlkit.items import Trivia
 from tomlkit.items import Whitespace
 from tomlkit.items import item as item
 from tomlkit.parser import Parser
+from tomlkit.recovery import ParseDiagnostic
 from tomlkit.toml_document import TOMLDocument as TOMLDocument
 
 
@@ -104,6 +105,27 @@ def parse(string: str | bytes) -> TOMLDocument:
     Parses a string or bytes into a TOMLDocument.
     """
     return Parser(string).parse()
+
+
+def parse_with_recovery(string: str | bytes) -> tuple[TOMLDocument, list[ParseDiagnostic]]:
+    """
+    Parses a string or bytes into a TOMLDocument, recovering from syntax
+    errors instead of raising on the first one.
+
+    Each unparseable fragment is stored in the document as an opaque
+    :class:`tomlkit.items.ErrorFragment` node (preserving its original text
+    and character span) and reported in the returned diagnostics list, so
+    tools like editors can keep showing and editing the valid parts of a
+    half-written document. A diagnostic with ``incomplete=True`` means no
+    safe recovery point could be determined and the remainder of the input
+    was swallowed into a single unparsed region.
+
+    Edits targeting a key claimed by an error fragment are rejected with
+    :class:`tomlkit.exceptions.ErrorFragmentEditError`.
+
+    Returns a tuple of the document and the list of diagnostics.
+    """
+    return Parser(string).parse_with_recovery()
 
 
 def document() -> TOMLDocument:

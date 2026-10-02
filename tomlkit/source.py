@@ -216,6 +216,14 @@ class Source(str):
         """
         self._marker = self._idx
 
+    def seek(self, idx: int) -> None:
+        """
+        Moves the cursor to an absolute position, resetting the marker.
+        """
+        self._idx = idx
+        self._current = self[idx] if idx < len(self) else self.EOF
+        self._marker = idx
+
     def parse_error(
         self,
         exception: type[ParseError] = ParseError,

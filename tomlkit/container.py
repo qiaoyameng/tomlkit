@@ -14,11 +14,13 @@ if TYPE_CHECKING:
 from tomlkit._compat import decode
 from tomlkit._types import _CustomDict
 from tomlkit._utils import merge_dicts
+from tomlkit.exceptions import ErrorFragmentEditError
 from tomlkit.exceptions import KeyAlreadyPresent
 from tomlkit.exceptions import NonExistentKey
 from tomlkit.exceptions import TOMLKitError
 from tomlkit.items import AoT
 from tomlkit.items import Comment
+from tomlkit.items import ErrorFragment
 from tomlkit.items import Item
 from tomlkit.items import Key
 from tomlkit.items import Null
@@ -53,6 +55,9 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         # out-of-order tables doesn't have to scan every key in the map;
         # stale entries are filtered by the per-key isinstance check
         self._out_of_order_keys: set[Key] = set()
+        # keys reserved by ErrorFragment nodes in this container; edits
+        # targeting them are rejected so broken text is never silently dropped
+        self._error_claims: set[str] = set()
 
     @property
     def body(self) -> list[tuple[Key | None, Item]]:
@@ -235,6 +240,13 @@ class Container(_CustomDict):  # type: ignore[type-arg]
 
         if not isinstance(item, Item):
             item = _item(item)
+
+        if key is not None and not self._parsed and self._error_claims:
+            # Refuse edits whose path falls into an unparsed error fragment:
+            # silently shadowing its broken text is not allowed.
+            parts = key.key.split(".")
+            if any(".".join(parts[:i]) in self._error_claims for i in range(1, len(parts) + 1)):
+                raise ErrorFragmentEditError(key)
 
         if key is not None and key.is_multi():
             self._handle_dotted_key(key, item)
@@ -456,6 +468,9 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                 raise TOMLKitError("Redefinition of an existing table")
 
     def _raw_append(self, key: Key | None, item: Item) -> None:
+        if isinstance(item, ErrorFragment):
+            self._error_claims.update(item.claimed_keys)
+
         if key is not None and key in self._map:
             current_idx = self._map[key]
             if not isinstance(current_idx, tuple):
@@ -1016,6 +1031,10 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         self._out_of_order_keys = {
             k for k, v in self._map.items() if isinstance(v, tuple)
         }
+        self._error_claims = set()
+        for _, item in self._body:
+            if isinstance(item, ErrorFragment):
+                self._error_claims.update(item.claimed_keys)
 
         for key, item in self._body:
             if key is not None:
@@ -1032,6 +1051,7 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         c._body += self.body
         c._map.update(self._map)
         c._out_of_order_keys |= self._out_of_order_keys
+        c._error_claims |= self._error_claims
 
         return c
 

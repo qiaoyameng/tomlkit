@@ -23,6 +23,7 @@ from tomlkit.exceptions import InvalidNumberError
 from tomlkit.exceptions import InvalidTimeError
 from tomlkit.exceptions import InvalidUnicodeValueError
 from tomlkit.exceptions import ParseError
+from tomlkit.exceptions import TOMLKitError
 from tomlkit.exceptions import UnexpectedCharError
 from tomlkit.exceptions import UnexpectedEofError
 from tomlkit.items import AoT
@@ -32,6 +33,7 @@ from tomlkit.items import BoolType
 from tomlkit.items import Comment
 from tomlkit.items import Date
 from tomlkit.items import DateTime
+from tomlkit.items import ErrorFragment
 from tomlkit.items import Float
 from tomlkit.items import InlineTable
 from tomlkit.items import Integer
@@ -46,6 +48,8 @@ from tomlkit.items import Table
 from tomlkit.items import Time
 from tomlkit.items import Trivia
 from tomlkit.items import Whitespace
+from tomlkit.recovery import ParseDiagnostic
+from tomlkit.recovery import find_fragment_end
 from tomlkit.source import Source
 from tomlkit.source import _StateHandler
 from tomlkit.toml_document import TOMLDocument
@@ -106,6 +110,10 @@ class Parser:
 
         self._aot_stack: list[Key] = []
         self._nesting_depth = 0
+        # Recovery mode is enabled by parse_with_recovery(): while this list
+        # is not None, parse errors are collected here and unparseable
+        # fragments are stored as ErrorFragment nodes instead of raising.
+        self._diagnostics: list[ParseDiagnostic] | None = None
 
     @property
     def _state(self) -> _StateHandler:
@@ -182,9 +190,66 @@ class Parser:
                 break
 
             # Otherwise, take and append one KV
+            if not self._parse_body_item(body):
+                break
+
+        while not self.end():
+            if self._current != "[" and self._diagnostics is not None:
+                # Recovery mode only: a broken table header may leave stray
+                # key/values or whitespace at the top level; recover them like
+                # leading content instead of failing outright.
+                if not self._parse_body_item(body):
+                    break
+                continue
+
+            item_start = self._idx
+            try:
+                key, value = self._parse_table()
+                if isinstance(value, Table) and value.is_aot_element():
+                    # This is just the first table in an AoT. Parse the rest of
+                    # the array along with it.
+                    value = self._parse_aot(value, key)
+
+                try:
+                    body.append(key, value)
+                except Exception as e:
+                    raise self.parse_error(ParseError, str(e)) from e
+            except TOMLKitError as e:
+                if self._diagnostics is None:
+                    raise
+                body.append(None, self._recover(e, item_start))
+
+        body.parsing(False)
+
+        return body
+
+    def parse_with_recovery(self) -> tuple[TOMLDocument, list[ParseDiagnostic]]:
+        """
+        Parses the input, recovering from syntax errors instead of raising.
+
+        Each unparseable fragment is stored in the document as an opaque
+        ErrorFragment node (preserving its original text and character span)
+        and reported in the returned diagnostics list; the valid parts of the
+        document keep their normal, editable container interface.
+        """
+        self._diagnostics = []
+        document = self.parse()
+        diagnostics = self._diagnostics
+        self._diagnostics = None
+
+        return document, diagnostics
+
+    def _parse_body_item(self, body: TOMLDocument) -> bool:
+        """
+        Parses and appends one non-table item to the document body.
+
+        Returns False when no further item can be parsed.
+        """
+        item_start = self._idx
+        try:
             item = self._parse_item()
             if not item:
-                break
+                return False
 
             key, value = item
             if (key is not None and key.is_multi()) or not self._merge_ws(value, body):
@@ -195,22 +260,42 @@ class Parser:
                     raise self.parse_error(ParseError, str(e)) from e
 
             self.mark()
+        except TOMLKitError as e:
+            if self._diagnostics is None:
+                raise
+            body.append(None, self._recover(e, item_start))
 
-        while not self.end():
-            key, value = self._parse_table()
-            if isinstance(value, Table) and value.is_aot_element():
-                # This is just the first table in an AoT. Parse the rest of the array
-                # along with it.
-                value = self._parse_aot(value, key)
+        return True
 
-            try:
-                body.append(key, value)
-            except Exception as e:
-                raise self.parse_error(ParseError, str(e)) from e
+    def _recover(self, error: TOMLKitError, start: int) -> ErrorFragment:
+        """
+        Builds an opaque ErrorFragment for the statement that failed at
+        ``start``, records a diagnostic and resynchronizes the parser on the
+        next safe statement boundary.
+        """
+        assert self._diagnostics is not None
+        src = self._src
+        end, complete = find_fragment_end(src, start)
+        if isinstance(error, ParseError):
+            line, col = error.line, error.col
+        else:
+            line = src.count("\n", 0, start) + 1
+            col = start - (src.rfind("\n", 0, start) + 1)
 
-        body.parsing(False)
+        self._diagnostics.append(
+            ParseDiagnostic(
+                message=str(error),
+                line=line,
+                col=col,
+                start=start,
+                end=end,
+                error=error,
+                incomplete=not complete,
+            )
+        )
+        src.seek(end)
 
-        return body
+        return ErrorFragment(src[start:end], start, end)
 
     def _merge_ws(self, item: Item, container: Container) -> bool:
         """
@@ -1122,30 +1207,61 @@ class Parser:
                 key = name_parts[0]
 
         while not self.end():
-            parsed = self._parse_item()
+            item_start = self._idx
+            try:
+                parsed = self._parse_item()
+            except TOMLKitError as e:
+                if self._diagnostics is None:
+                    raise
+                table.raw_append(None, self._recover(e, item_start))
+                continue
+
             if parsed:
                 _key, _val = parsed
-                if not self._merge_ws(_val, values):
-                    table.raw_append(_key, _val)
+                try:
+                    if not self._merge_ws(_val, values):
+                        table.raw_append(_key, _val)
+                except TOMLKitError as e:
+                    if self._diagnostics is None:
+                        raise
+                    table.raw_append(None, self._recover(e, item_start))
             else:
                 if self._current == "[":
-                    _, key_next = self._peek_table()
+                    try:
+                        _, key_next = self._peek_table()
+                    except TOMLKitError as e:
+                        if self._diagnostics is None:
+                            raise
+                        table.raw_append(None, self._recover(e, self._idx))
+                        break
 
                     if self._is_child(full_key, key_next):
-                        key_next, table_next = self._parse_table(full_key, table)
+                        while True:
+                            child_start = self._idx
+                            try:
+                                key_next, table_next = self._parse_table(
+                                    full_key, table
+                                )
+                                table.raw_append(key_next, table_next)
+                            except TOMLKitError as e:
+                                if self._diagnostics is None:
+                                    raise
+                                table.raw_append(None, self._recover(e, child_start))
 
-                        table.raw_append(key_next, table_next)
+                            # Picking up any sibling
+                            if self.end():
+                                break
 
-                        # Picking up any sibling
-                        while not self.end():
-                            _, key_next = self._peek_table()
+                            try:
+                                _, key_next = self._peek_table()
+                            except TOMLKitError as e:
+                                if self._diagnostics is None:
+                                    raise
+                                table.raw_append(None, self._recover(e, self._idx))
+                                break
 
                             if not self._is_child(full_key, key_next):
                                 break
-
-                            key_next, table_next = self._parse_table(full_key, table)
-
-                            table.raw_append(key_next, table_next)
 
                     break
                 else:
@@ -1196,16 +1312,17 @@ class Parser:
         """
         payload: list[Table] = [first]
         self._aot_stack.append(name_first)
-        while not self.end():
-            is_aot_next, name_next = self._peek_table()
-            if is_aot_next and name_next == name_first:
-                _, table = self._parse_table(name_first)
-                assert isinstance(table, Table)
-                payload.append(table)
-            else:
-                break
-
-        self._aot_stack.pop()
+        try:
+            while not self.end():
+                is_aot_next, name_next = self._peek_table()
+                if is_aot_next and name_next == name_first:
+                    _, table = self._parse_table(name_first)
+                    assert isinstance(table, Table)
+                    payload.append(table)
+                else:
+                    break
+        finally:
+            self._aot_stack.pop()
 
         return AoT(payload, parsed=True)
 

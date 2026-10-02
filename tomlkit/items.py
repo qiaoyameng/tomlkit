@@ -32,6 +32,7 @@ from tomlkit._utils import CONTROL_CHARS
 from tomlkit._utils import escape_string
 from tomlkit.exceptions import ConvertError
 from tomlkit.exceptions import InvalidStringError
+from tomlkit.recovery import extract_claimed_keys
 
 
 if TYPE_CHECKING:
@@ -611,6 +612,75 @@ class Comment(Item):
 
     def __str__(self) -> str:
         return f"{self._trivia.indent}{decode(self._trivia.comment)}"
+
+
+class ErrorFragment(Item):
+    """
+    An opaque fragment of a document that could not be parsed.
+
+    Instances are only created by :func:`tomlkit.parse_with_recovery`: the
+    fragment keeps the original text (``raw``) and its character span in the
+    source (``start``/``end``) so the document can be dumped losslessly even
+    though this part is not editable through the item API. Keys that the
+    fragment appears to define are exposed as ``claimed_keys``; containers
+    refuse edits targeting them so broken text is never silently dropped.
+    """
+
+    def __init__(
+        self,
+        raw: str,
+        start: int = -1,
+        end: int = -1,
+        claimed_keys: Iterable[str] | None = None,
+    ) -> None:
+        super().__init__(Trivia(indent="", comment_ws="", comment="", trail=""))
+        self._raw = raw
+        self._start = start
+        self._end = end
+        if claimed_keys is None:
+            claimed_keys = extract_claimed_keys(raw)
+        self._claimed_keys = frozenset(claimed_keys)
+
+    @property
+    def raw(self) -> str:
+        """The original, unparsed text of the fragment."""
+        return self._raw
+
+    @property
+    def start(self) -> int:
+        """Character offset of the fragment start in the source (-1 if unknown)."""
+        return self._start
+
+    @property
+    def end(self) -> int:
+        """Character offset of the fragment end in the source (-1 if unknown)."""
+        return self._end
+
+    @property
+    def span(self) -> tuple[int, int]:
+        """The (start, end) character offsets of the fragment."""
+        return self._start, self._end
+
+    @property
+    def claimed_keys(self) -> frozenset:
+        """Keys the fragment appears to define and therefore reserves."""
+        return self._claimed_keys
+
+    @property
+    def discriminant(self) -> int:
+        return 13
+
+    def as_string(self) -> str:
+        return self._raw
+
+    def unwrap(self) -> str:
+        return self._raw
+
+    def __repr__(self) -> str:
+        return f"<ErrorFragment {self._raw!r}>"
+
+    def _getstate(self, protocol: int = 3) -> tuple[str, int, int, frozenset]:
+        return self._raw, self._start, self._end, self._claimed_keys
 
 
 class Integer(Item, _CustomInt):

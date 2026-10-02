@@ -200,6 +200,23 @@ class KeyAlreadyPresent(TOMLKitError):
         super().__init__(message)
 
 
+class ErrorFragmentEditError(TOMLKitError):
+    """
+    An edit targeted a key that belongs to an unparsed error fragment
+    produced by recovery parsing. The fragment must be fixed or removed
+    before the key can be edited, so broken text is never silently dropped.
+    """
+
+    def __init__(self, key: object) -> None:
+        key = getattr(key, "key", key)
+        message = (
+            f'Key "{key}" belongs to an unparsed error fragment; '
+            "fix or remove the fragment before editing it."
+        )
+
+        super().__init__(message)
+
+
 class InvalidControlChar(ParseError):
     def __init__(self, line: int, col: int, char: int, type: str) -> None:
         display_code = "\\u00"
