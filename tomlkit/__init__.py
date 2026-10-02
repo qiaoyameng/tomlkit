@@ -1,4 +1,8 @@
+from tomlkit.api import BatchError
+from tomlkit.api import BatchOperationError
 from tomlkit.api import TOMLDocument
+from tomlkit.api import apply_batch
+from tomlkit.api import batch
 from tomlkit.api import aot
 from tomlkit.api import array
 from tomlkit.api import boolean
@@ -29,7 +33,11 @@ from tomlkit.api import ws
 
 __version__ = "0.15.1"
 __all__ = [
+    "BatchError",
+    "BatchOperationError",
     "TOMLDocument",
+    "apply_batch",
+    "batch",
     "aot",
     "array",
     "boolean",

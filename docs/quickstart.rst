@@ -146,3 +146,33 @@ It can be created with the following code::
     >>> database["enabled"] = True
 
     >>> doc["database"] = database
+
+Atomic batch updates
+---------------------
+
+Use ``batch()`` to apply several changes atomically. Paths are sequences of key
+fragments and array indexes. Each operation sees the result of every successful
+operation preceding it.
+
+    >>> from tomlkit import parse
+    >>> doc = parse('ports = [8000]\n')
+    >>> doc.batch([
+    ...     {"op": "test", "path": ["ports", 0], "value": 8000},
+    ...     {"op": "append", "path": ["ports"], "value": 8001},
+    ... ])  # doctest: +SKIP
+    <tomlkit.toml_document.TOMLDocument object at ...>
+
+The supported operations are:
+
+- ``set``: set or replace a value at a path; missing intermediate tables are
+  created.
+- ``delete``: remove an existing key or array element.
+- ``append``: append a value to an existing array.
+- ``test``: compare the old value using TOML type semantics. In particular,
+  booleans are not integers.
+
+The whole batch first runs on an internal deep copy. If any operation fails, no
+part of the original document is modified. On success the document keeps its
+identity and adopts the copied state atomically. Nested table or array views
+held before the call stay accessible as independent pre-batch snapshots; fetch
+views from the returned document to see the new state.

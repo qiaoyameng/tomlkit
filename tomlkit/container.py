@@ -1024,6 +1024,17 @@ class Container(_CustomDict):  # type: ignore[type-arg]
     def copy(self) -> Self:
         return copy.copy(self)
 
+    def _replace_state(self, other: Container) -> None:
+        self._map = other._map
+        self._body = other._body
+        self._parsed = other._parsed
+        self._table_keys = other._table_keys
+        self._validation_cache = other._validation_cache
+        self._out_of_order_keys = other._out_of_order_keys
+        dict.clear(self)
+        for key, value in dict.items(other):
+            dict.__setitem__(self, key, value)
+
     def __copy__(self) -> Self:
         c = self.__class__(self._parsed)
         for k, v in dict.items(self):
