@@ -1,5 +1,6 @@
 from tomlkit.api import TOMLDocument
 from tomlkit.api import aot
+from tomlkit.api import apply_batch
 from tomlkit.api import array
 from tomlkit.api import boolean
 from tomlkit.api import comment
@@ -31,6 +32,7 @@ __version__ = "0.15.1"
 __all__ = [
     "TOMLDocument",
     "aot",
+    "apply_batch",
     "array",
     "boolean",
     "comment",

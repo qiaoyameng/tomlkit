@@ -232,3 +232,67 @@ class ConvertError(TypeError, ValueError, TOMLKitError):
     It should be a TypeError, but due to historical reasons
     it needs to subclass ValueError as well.
     """
+
+
+class BatchError(TOMLKitError):
+    """
+    A single operation of a batch (see tomlkit.apply_batch) failed.
+
+    The whole batch is aborted and the document is left untouched. The
+    failing operation is identified by its zero-based index within the
+    batch, its op kind and its path.
+    """
+
+    def __init__(
+        self,
+        index: int,
+        op: str,
+        path: tuple[object, ...],
+        message: str | None = None,
+    ) -> None:
+        self.index = index
+        self.op = op
+        self.path = tuple(path)
+
+        if message is None:
+            message = "batch operation failed"
+
+        super().__init__(
+            f"{message} (operation {index}: {op} {self._render_path(self.path)})"
+        )
+
+    @staticmethod
+    def _render_path(path: tuple[object, ...]) -> str:
+        rendered = ""
+        for segment in path:
+            if isinstance(segment, str):
+                rendered += f".{segment}" if rendered else segment
+            else:
+                rendered += f"[{segment}]"
+        return rendered or "<root>"
+
+
+class BatchTestFailed(BatchError):
+    """
+    A test operation of a batch did not match the current value.
+
+    Comparison follows TOML value type semantics: a boolean is never equal
+    to an integer, and an integer is never equal to a float.
+    """
+
+    def __init__(
+        self,
+        index: int,
+        path: tuple[object, ...],
+        expected: object,
+        actual: object,
+    ) -> None:
+        self.expected = expected
+        self.actual = actual
+
+        super().__init__(
+            index,
+            "test",
+            path,
+            f"test failed: expected {expected!r}, got {actual!r}",
+        )

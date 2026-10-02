@@ -40,6 +40,13 @@ TOML Items
    :members:
    :exclude-members: item, AbstractTable
 
+TOML Batch Operations
+---------------------
+
+.. automodule:: tomlkit.batch
+   :members: Op, apply_batch
+   :show-inheritance:
+
 TOML Exceptions
 ---------------
 

@@ -11,6 +11,7 @@ from typing import Any
 from typing import TypeVar
 
 from tomlkit._utils import parse_rfc3339
+from tomlkit.batch import apply_batch as apply_batch
 from tomlkit.container import Container
 from tomlkit.exceptions import UnexpectedCharError
 from tomlkit.items import CUSTOM_ENCODERS

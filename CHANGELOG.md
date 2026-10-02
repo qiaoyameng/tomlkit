@@ -1,5 +1,11 @@
 # Change Log
 
+## [Unreleased]
+
+### Added
+
+- Add tomlkit.apply_batch(), an atomic batch entry point for applying multiple configuration changes (set, delete, append and old-value-checking test operations) to a document. Paths mix key segments and array indices, each operation sees the result of the previous ones, and test compares with TOML value type semantics (a boolean is never equal to an integer). The batch runs on an internal copy, so a failure reports the operation index and path and leaves the document — and any previously fetched views — untouched, while comments and formatting of unmodified nodes are preserved on success.
+
 ## [0.15.1] - 2026-07-17
 
 ### Changed
