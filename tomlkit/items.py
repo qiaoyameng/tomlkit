@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import copy
 import dataclasses
+import decimal
 import inspect
 import re
 import string
@@ -59,6 +60,12 @@ def item(value: int, _parent: Item | None = ..., _sort_keys: bool = ...) -> Inte
 
 @overload
 def item(value: float, _parent: Item | None = ..., _sort_keys: bool = ...) -> Float: ...
+
+
+@overload
+def item(
+    value: decimal.Decimal, _parent: Item | None = ..., _sort_keys: bool = ...
+) -> Decimal: ...
 
 
 @overload
@@ -136,6 +143,13 @@ def item(value: Any, _parent: Item | None = None, _sort_keys: bool = False) -> I
         return Integer(value, Trivia(), str(value))
     elif isinstance(value, float):
         return Float(value, Trivia(), str(value))
+    elif isinstance(value, decimal.Decimal):
+        # Custom encoders registered for Decimal take precedence over the
+        # built-in decimal support for backward compatibility.
+        encoded = _apply_custom_encoders(value, _parent, _sort_keys)
+        if encoded is not None:
+            return encoded
+        return Decimal(value, Trivia(), _decimal_to_toml_raw(value))
     elif isinstance(value, dict):
         table_constructor = (
             InlineTable if isinstance(_parent, (Array, InlineTable)) else Table
@@ -210,28 +224,38 @@ def item(value: Any, _parent: Item | None = None, _sort_keys: bool = False) -> I
             fold=value.fold,
         )
     else:
-        for encoder in CUSTOM_ENCODERS:
-            try:
-                # Check if encoder accepts keyword arguments for backward compatibility
-                sig = inspect.signature(encoder)
-                if "_parent" in sig.parameters or any(
-                    p.kind == p.VAR_KEYWORD for p in sig.parameters.values()
-                ):
-                    # New style encoder that can accept additional parameters
-                    rv = encoder(value, _parent=_parent, _sort_keys=_sort_keys)  # type: ignore[call-arg]
-                else:
-                    # Old style encoder that only accepts value
-                    rv = encoder(value)
-            except ConvertError:
-                pass
-            else:
-                if not isinstance(rv, Item):
-                    raise ConvertError(
-                        f"Custom encoder is expected to return an instance of Item, got {type(rv)}"
-                    )
-                return rv
+        encoded = _apply_custom_encoders(value, _parent, _sort_keys)
+        if encoded is not None:
+            return encoded
 
     raise ConvertError(f"Unable to convert an object of {type(value)} to a TOML item")
+
+
+def _apply_custom_encoders(
+    value: Any, _parent: Item | None = None, _sort_keys: bool = False
+) -> Item | None:
+    for encoder in CUSTOM_ENCODERS:
+        try:
+            # Check if encoder accepts keyword arguments for backward compatibility
+            sig = inspect.signature(encoder)
+            if "_parent" in sig.parameters or any(
+                p.kind == p.VAR_KEYWORD for p in sig.parameters.values()
+            ):
+                # New style encoder that can accept additional parameters
+                rv = encoder(value, _parent=_parent, _sort_keys=_sort_keys)  # type: ignore[call-arg]
+            else:
+                # Old style encoder that only accepts value
+                rv = encoder(value)
+        except ConvertError:
+            pass
+        else:
+            if not isinstance(rv, Item):
+                raise ConvertError(
+                    f"Custom encoder is expected to return an instance of Item, got {type(rv)}"
+                )
+            return rv
+
+    return None
 
 
 def _format_time(value: time) -> str:
@@ -989,6 +1013,190 @@ class Float(Item, _CustomFloat):
     __trunc__ = float.__trunc__
     __ceil__ = float.__ceil__
     __floor__ = float.__floor__
+
+
+def _decimal_to_toml_raw(value: decimal.Decimal) -> str:
+    """Render a :class:`decimal.Decimal` as a valid TOML float literal.
+
+    ``str()`` of a Decimal never depends on the active decimal context, so
+    the conversion is exact.  The result always contains a fractional dot or
+    an exponent so that it can never be re-parsed as a TOML integer, and
+    non-finite values map to the TOML ``inf``/``nan`` literals.
+    """
+    if value.is_nan():
+        return "-nan" if value.is_signed() else "nan"
+
+    if value.is_infinite():
+        return "-inf" if value.is_signed() else "inf"
+
+    raw = str(value)
+    if "." not in raw and "e" not in raw and "E" not in raw:
+        # An integral Decimal (e.g. Decimal("3")) must still serialize as a
+        # TOML float, otherwise it would be re-parsed as an integer.
+        raw += ".0"
+
+    return raw
+
+
+class Decimal(Item, decimal.Decimal):
+    """
+    A float literal backed by :class:`decimal.Decimal`.
+
+    Produced when parsing with ``parse_float=decimal.Decimal`` or when
+    wrapping a ``decimal.Decimal`` value.  Unlike :class:`Float`, the exact
+    decimal value is preserved at the semantic layer; unmodified items keep
+    their original literal (exponent, sign and underscores) when rendered.
+    """
+
+    def __new__(cls, value: decimal.Decimal, trivia: Trivia, raw: str) -> Decimal:
+        return decimal.Decimal.__new__(cls, value)
+
+    def __init__(self, value: decimal.Decimal, trivia: Trivia, raw: str) -> None:
+        super().__init__(trivia)
+        self._original = decimal.Decimal(value)
+        self._raw = raw
+        self._sign = False
+
+        if re.match(r"^[+\-].+$", raw):
+            self._sign = True
+
+    def unwrap(self) -> decimal.Decimal:
+        return self._original
+
+    def __hash__(self) -> int:
+        return hash(self.unwrap())
+
+    @property
+    def discriminant(self) -> int:
+        return 13
+
+    @property
+    def value(self) -> Decimal:
+        """The wrapped decimal value"""
+        return self
+
+    def as_string(self) -> str:
+        return self._raw
+
+    def _new(self, result: decimal.Decimal) -> Decimal:
+        raw = _decimal_to_toml_raw(result)
+
+        if self._sign and not result.is_signed():
+            raw = f"+{raw}"
+
+        return Decimal(result, self._trivia, raw)
+
+    def _getstate(self, protocol: int = 3) -> tuple[decimal.Decimal, Trivia, str]:
+        return decimal.Decimal(self), self._trivia, self._raw
+
+    # Decimal methods — explicit typed wrappers
+    def __abs__(self) -> Decimal:
+        return self._new(decimal.Decimal.__abs__(self))
+
+    def __add__(self, other: object) -> Decimal:
+        result = decimal.Decimal.__add__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    __eq__ = decimal.Decimal.__eq__
+
+    def __floordiv__(self, other: object) -> Decimal:
+        result = decimal.Decimal.__floordiv__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    __le__ = decimal.Decimal.__le__
+    __lt__ = decimal.Decimal.__lt__
+
+    def __mod__(self, other: object) -> Decimal:
+        result = decimal.Decimal.__mod__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __mul__(self, other: object) -> Decimal:
+        result = decimal.Decimal.__mul__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __neg__(self) -> Decimal:
+        return self._new(decimal.Decimal.__neg__(self))
+
+    def __pos__(self) -> Decimal:
+        return self._new(decimal.Decimal.__pos__(self))
+
+    def __pow__(self, other: object, mod: None = None) -> Decimal:
+        result = decimal.Decimal.__pow__(self, other, mod)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[no-any-return]
+        return self._new(result)
+
+    def __radd__(self, other: object) -> Decimal:
+        result = decimal.Decimal.__radd__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __rfloordiv__(self, other: object) -> Decimal:
+        result = decimal.Decimal.__rfloordiv__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __rmod__(self, other: object) -> Decimal:
+        result = decimal.Decimal.__rmod__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __rmul__(self, other: object) -> Decimal:
+        result = decimal.Decimal.__rmul__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __round__(self, ndigits: int | None = None) -> Decimal | int:
+        if ndigits is None:
+            result = decimal.Decimal.__round__(self)
+        else:
+            result = decimal.Decimal.__round__(self, ndigits)
+        if not isinstance(result, decimal.Decimal):
+            # round() without ndigits returns a plain int
+            return result
+        return self._new(result)
+
+    def __rpow__(self, other: object, mod: None = None) -> Decimal:
+        result = decimal.Decimal.__rpow__(self, other, mod)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[no-any-return]
+        return self._new(result)
+
+    def __rsub__(self, other: object) -> Decimal:
+        result = decimal.Decimal.__rsub__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __rtruediv__(self, other: object) -> Decimal:
+        result = decimal.Decimal.__rtruediv__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __sub__(self, other: object) -> Decimal:
+        result = decimal.Decimal.__sub__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __truediv__(self, other: object) -> Decimal:
+        result = decimal.Decimal.__truediv__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
 
 
 class Bool(Item):

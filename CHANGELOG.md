@@ -1,5 +1,11 @@
 # Change Log
 
+## [Unreleased]
+
+### Added
+
+- Add an optional Decimal numeric mode: `parse()`/`loads()`/`load()` now accept a `parse_float` argument (mirroring `tomllib`); passing `decimal.Decimal` makes finite TOML floats exact `Decimal` values at the semantic layer while unmodified literals keep their original exponent, sign and underscore formatting. Assigning a `Decimal` always renders a valid TOML float literal — integral values become `3.0`, never an integer — and `inf`/`nan` remain plain floats. Conversion is exact regardless of the active decimal context precision.
+
 ## [0.15.1] - 2026-07-17
 
 ### Changed

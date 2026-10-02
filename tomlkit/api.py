@@ -5,6 +5,7 @@ import datetime as _datetime
 
 from collections.abc import Iterable
 from collections.abc import Mapping
+from typing import Callable
 from typing import IO
 from typing import TYPE_CHECKING
 from typing import Any
@@ -44,13 +45,15 @@ if TYPE_CHECKING:
     E = TypeVar("E", bound=Encoder)
 
 
-def loads(string: str | bytes) -> TOMLDocument:
+def loads(
+    string: str | bytes, parse_float: Callable[[str], Any] = float
+) -> TOMLDocument:
     """
     Parses a string into a TOMLDocument.
 
     Alias for parse().
     """
-    return parse(string)
+    return parse(string, parse_float=parse_float)
 
 
 def dumps(data: Mapping[str, Any], sort_keys: bool = False) -> str:
@@ -77,11 +80,13 @@ def dumps(data: Mapping[str, Any], sort_keys: bool = False) -> str:
         raise TypeError(msg) from ex
 
 
-def load(fp: IO[str] | IO[bytes]) -> TOMLDocument:
+def load(
+    fp: IO[str] | IO[bytes], parse_float: Callable[[str], Any] = float
+) -> TOMLDocument:
     """
     Load toml document from a file-like object.
     """
-    return parse(fp.read())
+    return parse(fp.read(), parse_float=parse_float)
 
 
 def dump(data: Mapping[str, Any], fp: IO[str], *, sort_keys: bool = False) -> None:
@@ -99,11 +104,19 @@ def dump(data: Mapping[str, Any], fp: IO[str], *, sort_keys: bool = False) -> No
     fp.write(dumps(data, sort_keys=sort_keys))
 
 
-def parse(string: str | bytes) -> TOMLDocument:
+def parse(
+    string: str | bytes, parse_float: Callable[[str], Any] = float
+) -> TOMLDocument:
     """
     Parses a string or bytes into a TOMLDocument.
+
+    :param parse_float: callable used to construct the value of finite TOML
+        floats.  Pass ``decimal.Decimal`` to preserve exact decimal
+        precision; unmodified values keep their original literal when the
+        document is rendered back.  ``inf`` and ``nan`` are always parsed
+        as Python floats.
     """
-    return Parser(string).parse()
+    return Parser(string, parse_float=parse_float).parse()
 
 
 def document() -> TOMLDocument:

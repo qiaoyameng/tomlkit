@@ -27,6 +27,38 @@ the content of TOML files and strings::
     >>> assert dumps(doc) == content
 
 
+Parsing floats as Decimals
+--------------------------
+
+By default TOML floats are parsed as Python floats, which can silently lose
+precision for long decimal literals (e.g. billing amounts).  Pass
+``parse_float=decimal.Decimal`` (mirroring the stdlib ``tomllib`` API) to
+get exact ``Decimal`` values at the semantic layer instead::
+
+    >>> import decimal
+    >>> from tomlkit import dumps
+    >>> from tomlkit import parse
+
+    >>> doc = parse("price = 1.2300000000000000000001\n", parse_float=decimal.Decimal)
+    >>> doc["price"].unwrap()
+    Decimal('1.2300000000000000000001')
+
+Unmodified values keep their original literal (exponent, sign and
+underscores) when the document is rendered back, and the conversion does
+not depend on the active decimal context precision.  ``inf`` and ``nan``
+have no exact decimal representation, so they are always parsed as Python
+floats; negative zero keeps its sign and compares equal to zero, following
+``Decimal`` semantics.
+
+Assigning a ``Decimal`` to a document always produces a valid TOML float
+literal, even for integral values, so it is never re-parsed as an integer::
+
+    >>> doc["tax"] = decimal.Decimal("3")
+    >>> print(dumps(doc), end="")
+    price = 1.2300000000000000000001
+    tax = 3.0
+
+
 Modifying
 ---------
 
