@@ -1687,3 +1687,201 @@ a.b = 1
     doc["z"] = 2
 
     assert doc.as_string() == "a.b = 1\nz = 2\n"
+
+
+def test_move_segmented_paths_preserves_comment_ownership_and_values() -> None:
+    content = dedent(
+        '''\
+        # server paragraph
+
+        [server]
+        # TLS block
+
+        tls."cert.path" = "/old.pem" # inline cert
+        tls.enabled = true
+        port = 443
+
+        [zebra]
+        keep = true
+        '''
+    )
+
+    doc = parse(content)
+    doc.move(["server", "tls"], ["security", "tls"])
+
+    expected = dedent(
+        '''\
+        # server paragraph
+
+        [server]
+        port = 443
+
+        [zebra]
+        keep = true
+        [security]
+        # TLS block
+
+        tls."cert.path" = "/old.pem" # inline cert
+
+        tls.enabled = true
+        '''
+    )
+
+    assert doc.as_string() == expected
+    reparsed = parse(doc.as_string())
+    assert reparsed["security"]["tls"]["cert.path"] == "/old.pem"
+    assert reparsed["security"]["tls"]["enabled"] is True
+    assert reparsed["server"] == {"port": 443}
+
+
+def test_move_quoted_dotted_and_out_of_order_tables() -> None:
+    content = dedent(
+        '''\
+        # dotted paragraph
+
+        # dotted attached
+        a."b.c".d = 1 # dotted trailing
+
+        [middle]
+        value = 2
+        '''
+    )
+
+    doc = parse(content)
+    doc.move(["a", "b.c"], ["new.name"])
+
+    assert doc.as_string() == dedent(
+        '''\
+        # dotted paragraph
+
+        # dotted attached
+        "new.name".d = 1 # dotted trailing
+
+        [middle]
+        value = 2
+        '''
+    )
+    reparsed = parse(doc.as_string())
+    assert reparsed["new.name"] == {"d": 1}
+
+
+def test_move_out_of_order_table_sections_updates_header_paths() -> None:
+    content = dedent(
+        '''\
+        [source.child]
+        value = 1
+
+        [middle]
+        value = 2
+
+        [source.other]
+        value = 3
+        '''
+    )
+
+    doc = parse(content)
+    doc.move(["source"], ["target"])
+
+    assert doc.as_string() == dedent(
+        '''\
+        [middle]
+        value = 2
+
+        [target.child]
+        value = 1
+
+        [target.other]
+        value = 3
+        '''
+    )
+    reparsed = parse(doc.as_string())
+    assert reparsed["target"] == {"child": {"value": 1}, "other": {"value": 3}}
+
+
+def test_move_array_of_tables_preserves_header_comment_and_elements() -> None:
+    content = dedent(
+        '''\
+        [before]
+        value = 1
+        # array paragraph
+
+        # array attached
+        [[server.tls]]
+        name = "first" # first trailing
+
+        [[server.tls]]
+        name = "second"
+
+        [after]
+        value = 2
+        '''
+    )
+
+    doc = parse(content)
+    doc.move(["server", "tls"], ["security", "endpoints"])
+
+    assert doc.as_string() == dedent(
+        '''\
+        [before]
+        value = 1
+        # array paragraph
+
+        [after]
+        value = 2
+        [security]
+        # array attached
+        [[security.endpoints]]
+        name = "first" # first trailing
+
+        [[security.endpoints]]
+        name = "second"
+
+        '''
+    )
+    assert parse(doc.as_string())["security"]["endpoints"] == [
+        {"name": "first"},
+        {"name": "second"},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        (["a"], ["a"]),
+        (["a"], ["a", "b"]),
+        (["a"], ["b"]),
+        (["missing"], ["b"]),
+        (["server", "tls"], ["value", "tls"]),
+        (["server", "tls"], ["server", "tls"]),
+    ],
+)
+def test_failed_move_leaves_complete_dump_unchanged(
+    source: list[str],
+    target: list[str],
+) -> None:
+    content = dedent(
+        '''\
+        value = 1
+        [server]
+        keep = true
+        [server.tls]
+        enabled = true
+        '''
+    )
+    doc = parse(content)
+
+    with pytest.raises((TOMLKitError, KeyError)):
+        doc.move(source, target)
+
+    assert doc.as_string() == content
+    assert parse(doc.as_string()).unwrap() == parse(content).unwrap()
+
+
+def test_move_does_not_split_dotted_key_names() -> None:
+    content = '"a.b" = 1 # quoted dot\nx = 2\n'
+    doc = parse(content)
+
+    doc.move(["a.b"], ["c.d"])
+
+    assert doc.as_string() == 'x = 2\n"c.d" = 1 # quoted dot\n'
+    assert parse(doc.as_string())["c.d"] == 1

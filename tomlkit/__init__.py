@@ -16,6 +16,7 @@ from tomlkit.api import key
 from tomlkit.api import key_value
 from tomlkit.api import load
 from tomlkit.api import loads
+from tomlkit.api import move
 from tomlkit.api import nl
 from tomlkit.api import parse
 from tomlkit.api import register_encoder
@@ -47,6 +48,7 @@ __all__ = [
     "key_value",
     "load",
     "loads",
+    "move",
     "nl",
     "parse",
     "register_encoder",

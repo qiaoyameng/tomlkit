@@ -37,6 +37,8 @@ from tomlkit.items import item as item
 from tomlkit.parser import Parser
 from tomlkit.toml_document import TOMLDocument as TOMLDocument
 
+MovePath = str | SingleKey | list[str | SingleKey]
+
 
 if TYPE_CHECKING:
     from tomlkit.items import Encoder
@@ -111,6 +113,16 @@ def document() -> TOMLDocument:
     Returns a new TOMLDocument instance.
     """
     return TOMLDocument()
+
+
+def move(
+    document: TOMLDocument,
+    source: MovePath,
+    target: MovePath,
+) -> TOMLDocument:
+    """Move ``source`` to ``target`` using explicit path segments."""
+    document.move(source, target)
+    return document
 
 
 # Items

@@ -4,6 +4,7 @@ import copy
 import math
 
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import Any
 
@@ -19,6 +20,7 @@ from tomlkit.exceptions import NonExistentKey
 from tomlkit.exceptions import TOMLKitError
 from tomlkit.items import AoT
 from tomlkit.items import Comment
+from tomlkit.items import InlineTable
 from tomlkit.items import Item
 from tomlkit.items import Key
 from tomlkit.items import Null
@@ -30,6 +32,200 @@ from tomlkit.items import item as _item
 
 
 _NOT_SET = object()
+
+PathLike = str | SingleKey
+
+
+@dataclass
+class _NodeFragment:
+    chain: list[tuple[Container, Item | None, Key | None]]
+    container: Container
+    index: int
+    key: Key
+    item: Item
+
+    def header_prefix(self) -> list[tuple[Key | None, Item]]:
+        prefix_container, prefix_index = self.prefix_location()
+        return _attached_prefix(prefix_container, prefix_index)
+
+    def header_prefix_range(self) -> tuple[Container, int, int]:
+        prefix_container, prefix_index = self.prefix_location()
+        prefix = _attached_prefix(prefix_container, prefix_index)
+        if prefix:
+            return prefix_container, prefix_index - len(prefix), prefix_index
+
+        comment_index = prefix_index - 1
+        while comment_index >= 0 and isinstance(
+            prefix_container.body[comment_index][1],
+            Whitespace,
+        ):
+            comment_index -= 1
+
+        comment_prefix = _attached_prefix(prefix_container, comment_index + 1)
+        if not comment_prefix:
+            return self.container, self.index, self.index
+
+        return prefix_container, comment_index + 1 - len(comment_prefix), prefix_index
+
+    def prefix_location(self) -> tuple[Container, int]:
+        if not isinstance(self.item, (AoT, Table)) or len(self.chain) < 2:
+            return self.container, self.index
+
+        local_prefix = _attached_prefix(self.container, self.index)
+        if local_prefix:
+            return self.container, self.index
+
+        root, _top_owner, _top_key = self.chain[0]
+        _root_container, top_item, _top_name = self.chain[1]
+        if not isinstance(top_item, Table):
+            return self.container, self.index
+
+        top_index = next(
+            (
+                index
+                for index, (_key, item) in enumerate(root.body)
+                if item is top_item
+            ),
+            None,
+        )
+        if top_index is None:
+            return self.container, self.index
+
+        previous_index = top_index - 1
+        while previous_index >= 0 and isinstance(
+            root.body[previous_index][1],
+            (Null, Whitespace),
+        ):
+            previous_index -= 1
+
+        if previous_index < 0:
+            return self.container, self.index
+
+        previous_item = root.body[previous_index][1]
+        if isinstance(previous_item, Table):
+            end_index = len(previous_item.value.body)
+            prefix = _attached_prefix(previous_item.value, end_index)
+            if not prefix:
+                prefix_index = end_index - 1
+                while prefix_index >= 0 and isinstance(
+                    previous_item.value.body[prefix_index][1],
+                    Whitespace,
+                ):
+                    prefix_index -= 1
+
+                if prefix_index >= 0:
+                    prefix = _attached_prefix(
+                        previous_item.value,
+                        prefix_index + 1,
+                    )
+                    end_index = prefix_index + 1
+
+            if prefix:
+                return previous_item.value, end_index
+
+        return self.container, self.index
+
+
+@dataclass
+class _ResolvedParent:
+    container: Container
+    owner: Item | None
+    chain: list[tuple[Container, Item | None, Key | None]]
+
+
+def _path_key(part: PathLike) -> SingleKey:
+    if isinstance(part, SingleKey):
+        return copy.copy(part)
+
+    if isinstance(part, Key) or not isinstance(part, str) or not part:
+        raise TOMLKitError("Path segments must be non-empty strings or single keys")
+
+    return SingleKey(part)
+
+
+def _normalise_path(path: str | SingleKey | list[str | SingleKey]) -> list[SingleKey]:
+    if isinstance(path, (str, Key)):
+        parts = [path]
+    elif isinstance(path, list):
+        parts = path
+    else:
+        raise TOMLKitError("A path must be a list of path segments")
+
+    if not parts:
+        raise TOMLKitError("A path must contain at least one segment")
+
+    return [_path_key(part) for part in parts]
+
+
+def _attached_prefix(container: Container, index: int) -> list[tuple[Key | None, Item]]:
+    prefix: list[tuple[Key | None, Item]] = []
+    i = min(index, len(container.body)) - 1
+    while i >= 0:
+        key, item = container.body[i]
+        if isinstance(item, Comment):
+            prefix.append((key, item))
+            i -= 1
+            continue
+
+        break
+
+    prefix.reverse()
+    return prefix
+
+
+def _clone_key_like(key: Key, new_part: SingleKey) -> SingleKey:
+    result = copy.copy(new_part)
+    if isinstance(key, SingleKey):
+        result.sep = "" if key.sep == "" else new_part.sep
+        result._dotted = key._dotted
+        if key.key == new_part.key:
+            result.t = key.t
+            result._original = key._original
+
+    return result
+
+
+def _sync_owner(owner: Table | None) -> None:
+    if owner is None or isinstance(owner, AoT):
+        return
+
+    dict.clear(owner)
+    for key, value in owner._value.body:
+        if key is not None:
+            dict.__setitem__(owner, key.key, value)
+
+
+def _sync_chain(chain: list[tuple[Container, Item | None, Key | None]]) -> None:
+    for _container, owner, _key in reversed(chain):
+        _sync_owner(owner if isinstance(owner, Table) else None)
+
+
+def _child_container(item: Item) -> Container | None:
+    value = getattr(item, "_value", None)
+    return value if isinstance(value, Container) else None
+
+
+def _relocate_display_names(
+    table: Table,
+    source_name: str,
+    target_name: str,
+) -> None:
+    def relocate(item: Item) -> None:
+        if isinstance(item, Table):
+            if item.display_name and item.display_name.startswith(
+                source_name + "."
+            ):
+                item.display_name = target_name + item.display_name[
+                    len(source_name) :
+                ]
+            for _key, child in item.value.body:
+                relocate(child)
+        elif isinstance(item, AoT):
+            for child in item.body:
+                relocate(child)
+
+    for _key, child in table.value.body:
+        relocate(child)
 
 
 class Container(_CustomDict):  # type: ignore[type-arg]
@@ -516,6 +712,667 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         dict.__delitem__(self, key.key)
 
         return self
+
+    def move(
+        self,
+        source: str | SingleKey | list[str | SingleKey],
+        target: str | SingleKey | list[str | SingleKey],
+    ) -> Container:
+        """Move an existing node to a new segmented path."""
+        source_parts = _normalise_path(source)
+        target_parts = _normalise_path(target)
+        source_path = tuple(part.key for part in source_parts)
+        target_path = tuple(part.key for part in target_parts)
+
+        if source_path == target_path:
+            raise TOMLKitError("Cannot move a node to itself")
+
+        if self._is_descendant_path(target_path, source_path):
+            raise TOMLKitError("Cannot move a node to one of its descendants")
+
+        from tomlkit.parser import Parser
+
+        state = (
+            copy.deepcopy(self._map),
+            copy.deepcopy(self._body),
+            self._parsed,
+            copy.deepcopy(self._table_keys),
+            copy.deepcopy(self._validation_cache),
+            copy.deepcopy(self._out_of_order_keys),
+            copy.deepcopy(list(dict.items(self))),
+        )
+        try:
+            fragments = self._resolve_fragments(source_parts)
+            if not fragments:
+                raise NonExistentKey(".".join(source_path))
+            source_prefixes = self._fragment_prefixes(fragments)
+            source_spacing = self._source_spacing(fragments, source_prefixes)
+            prefixes = self._extract_fragments(fragments)
+            self._prune_fragment_chains(fragments)
+
+            destination = self._get_destination_parent(
+                target_parts[:-1],
+                fragments,
+            )
+            if target_parts[-1] in destination.container._map:
+                raise KeyAlreadyPresent(target_parts[-1])
+
+            insert_at = self._move_insert_index(destination.container, fragments)
+            inserted = 0
+            for fragment in fragments:
+                fragment_insert_at = self._fragment_insert_index(
+                    destination.container,
+                    fragment,
+                    insert_at,
+                    inserted,
+                )
+                self._move_fragment(
+                    fragment,
+                    destination,
+                    source_parts,
+                    target_parts,
+                    source_prefixes[id(fragment)],
+                    source_spacing[id(fragment)],
+                    prefixes[id(fragment)],
+                    fragment_insert_at,
+                )
+                inserted += len(prefixes[id(fragment)]) + 1
+
+            Parser(self.as_string()).parse()
+        except Exception:
+            self._restore_move_state(state)
+            raise
+
+        return self
+
+    @staticmethod
+    def _is_descendant_path(
+        descendant: tuple[str, ...],
+        ancestor: tuple[str, ...],
+    ) -> bool:
+        return descendant[: len(ancestor)] == ancestor and descendant != ancestor
+
+    def _restore_move_state(self, state: tuple[Any, ...]) -> None:
+        (
+            self._map,
+            self._body,
+            self._parsed,
+            self._table_keys,
+            self._validation_cache,
+            self._out_of_order_keys,
+            dict_items,
+        ) = state
+        dict.clear(self)
+        for key, value in dict_items:
+            dict.__setitem__(self, key, value)
+
+    def _resolve_fragments(
+        self,
+        path: list[SingleKey],
+    ) -> list[_NodeFragment]:
+        part, *remaining = path
+        fragments: list[_NodeFragment] = []
+        for index in self._indices_for_key(part):
+            key, item = self._body[index]
+            assert key is not None
+            chain = [(self, None, None)]
+            if remaining:
+                fragments.extend(
+                    self._resolve_item_fragments(
+                        item,
+                        remaining,
+                        chain,
+                        key,
+                    )
+                )
+            else:
+                fragments.append(
+                    _NodeFragment(
+                        chain=chain,
+                        container=self,
+                        index=index,
+                        key=key,
+                        item=item,
+                    )
+                )
+
+        return fragments
+
+    def _indices_for_key(self, key: SingleKey) -> tuple[int, ...]:
+        index = self._map.get(key)
+        if index is None:
+            return ()
+        return index if isinstance(index, tuple) else (index,)
+
+    def _resolve_item_fragments(
+        self,
+        item: Item,
+        path: list[SingleKey],
+        chain: list[tuple[Container, Item | None, Key | None]],
+        current_key: Key,
+    ) -> list[_NodeFragment]:
+        part, *remaining = path
+        if isinstance(item, AoT):
+            raise TOMLKitError(
+                "Cannot traverse an array of tables with a segmented key"
+            )
+
+        container = _child_container(item)
+        if container is None:
+            return []
+
+        owner_chain = [*chain, (container, item, current_key)]
+        fragments: list[_NodeFragment] = []
+        for index in container._indices_for_key(part):
+            child_key, child_item = container.body[index]
+            assert child_key is not None
+            child_container = _child_container(child_item)
+            child_chain = (
+                [
+                    *owner_chain,
+                    (container, child_item, child_key),
+                    (child_container, child_item, child_key),
+                ]
+                if child_container is not None
+                else [*owner_chain, (container, child_item, child_key)]
+            )
+            if remaining:
+                fragments.extend(
+                    container._resolve_item_fragments(
+                        child_item,
+                        remaining,
+                        child_chain,
+                        child_key,
+                    )
+                )
+            else:
+                fragments.append(
+                    _NodeFragment(
+                        chain=child_chain,
+                        container=container,
+                        index=index,
+                        key=child_key,
+                        item=child_item,
+                    )
+                )
+
+        return fragments
+
+    def _get_destination_parent(
+        self,
+        path: list[SingleKey],
+        fragments: list[_NodeFragment],
+    ) -> _ResolvedParent:
+        container = self
+        owner: Item | None = None
+        chain: list[tuple[Container, Item | None, Key | None]] = [(self, None, None)]
+        physical_container = self
+        created_from_dotted = False
+
+        for depth, part in enumerate(path):
+            if part in container._map:
+                indices = container._indices_for_key(part)
+                if len(indices) > 1:
+                    raise TOMLKitError(
+                        "Cannot move to a key split across table sections"
+                    )
+
+                owner = container.body[indices[0]][1]
+                if isinstance(owner, AoT):
+                    raise TOMLKitError("Cannot move into an array of tables")
+
+                next_container = _child_container(owner)
+                if next_container is None:
+                    raise TOMLKitError("Target path exists but is not a table")
+
+                container = next_container
+                physical_container = container
+                chain.append((container, owner, part))
+                created_from_dotted = False
+                continue
+
+            is_leaf_parent = depth == len(path) - 1
+            item_is_table = any(
+                isinstance(fragment.item, (Table, AoT)) for fragment in fragments
+            )
+            use_dotted = is_leaf_parent and not item_is_table and (
+                depth > 0 or self._fragment_chain_is_dotted(fragments)
+            )
+            created = Table(
+                Container(True),
+                Trivia(),
+                False,
+                is_super_table=True,
+                name=part.key,
+            )
+            current_container = physical_container
+            key = copy.copy(part)
+            key.sep = ""
+            key._dotted = use_dotted
+            if item_is_table:
+                insert_index = len(current_container.body)
+                while insert_index > 0 and isinstance(
+                    current_container.body[insert_index - 1][1], Null
+                ):
+                    insert_index -= 1
+            else:
+                insert_index = current_container._get_last_index_before_table()
+
+            if insert_index < len(current_container.body) and not item_is_table:
+                current_container._insert_at(insert_index, key, created)
+            elif insert_index < len(current_container.body):
+                current_container._insert_unindexed_table_at(
+                    insert_index,
+                    key,
+                    created,
+                )
+            else:
+                current_container._raw_append(key, created)
+            current_container._table_keys.append(key)
+
+            if owner is not None:
+                dict.__setitem__(owner, part.key, created)
+
+            owner = created
+            container = created.value
+            physical_container = container
+            chain.append((container, created, key))
+            created_from_dotted = use_dotted
+
+        if isinstance(owner, InlineTable) and any(
+            isinstance(fragment.item, (Table, AoT)) for fragment in fragments
+        ):
+            raise TOMLKitError("Inline tables can only contain ordinary values")
+
+        if created_from_dotted:
+            parent_key = chain[-1][2]
+            if parent_key is not None:
+                parent_key._dotted = True
+
+        return _ResolvedParent(container, owner, chain)
+
+    @staticmethod
+    def _fragment_chain_is_dotted(fragments: list[_NodeFragment]) -> bool:
+        return any(
+            isinstance(key, SingleKey) and key._dotted
+            for fragment in fragments
+            for _container, _owner, key in fragment.chain
+            if key is not None
+        )
+
+    def _move_insert_index(
+        self,
+        container: Container,
+        fragments: list[_NodeFragment],
+    ) -> int:
+        if any(isinstance(fragment.item, (Table, AoT)) for fragment in fragments):
+            return len(container.body)
+
+        index = container._get_last_index_before_table()
+        while index > 0 and isinstance(container.body[index - 1][1], Null):
+            index -= 1
+
+        while index < len(container.body) and isinstance(
+            container.body[index][1], Null
+        ):
+            index += 1
+
+        return index
+
+    def _fragment_insert_index(
+        self,
+        container: Container,
+        fragment: _NodeFragment,
+        base_index: int,
+        inserted: int,
+    ) -> int:
+        if self._fragment_source_key_is_dotted(fragment) or not isinstance(
+            fragment.item,
+            (Table, AoT),
+        ):
+            index = min(
+                base_index + inserted,
+                container._get_last_index_before_table(),
+            )
+            while index < len(container.body) and isinstance(
+                container.body[index][1],
+                Null,
+            ):
+                index += 1
+
+            return index
+
+        if isinstance(fragment.item, (Table, AoT)):
+            index = len(container.body)
+            while index > 0 and isinstance(container.body[index - 1][1], Null):
+                index -= 1
+            return index
+
+        return base_index + inserted
+
+    def _insert_unindexed_table_at(
+        self,
+        index: int,
+        key: SingleKey,
+        item: Table,
+    ) -> None:
+        previous_item = self._previous_rendered_item(self, index)
+        if previous_item is not None and not (
+            isinstance(previous_item, Whitespace)
+            or ends_with_whitespace(previous_item)
+            or "\n" in previous_item.trivia.trail
+        ):
+            previous_item.trivia.trail += "\n"
+
+        for mapped_key, mapped_index in list(self._map.items()):
+            if isinstance(mapped_index, tuple):
+                self._map[mapped_key] = tuple(
+                    value + 1 if value >= index else value for value in mapped_index
+                )
+            elif mapped_index >= index:
+                self._map[mapped_key] = mapped_index + 1
+
+        self._map[key] = index
+        self._body.insert(index, (key, item))
+        dict.__setitem__(self, key.key, item.value)
+
+    def _move_fragment(
+        self,
+        fragment: _NodeFragment,
+        destination: _ResolvedParent,
+        source_parts: list[SingleKey],
+        target_parts: list[SingleKey],
+        source_prefix: list[tuple[Key | None, Item]],
+        blank_lines: int,
+        prefix: list[tuple[Key | None, Item]],
+        insert_at: int,
+    ) -> None:
+        key = self._destination_fragment_key(fragment, target_parts)
+        item = fragment.item
+
+        self._invalidate_moved_item(
+            item,
+            target_parts,
+            self._fragment_source_key_is_dotted(fragment),
+            ".".join(part.as_string() for part in source_parts),
+        )
+        self._preserve_moved_spacing(
+            destination.container,
+            fragment,
+            prefix,
+            blank_lines,
+            insert_at,
+        )
+        self._insert_prefix(destination.container, prefix, insert_at)
+        item_index = insert_at + len(prefix)
+        self._insert_moved_item(destination.container, key, item, item_index)
+        _sync_chain(destination.chain)
+
+    @staticmethod
+    def _fragment_source_key_is_dotted(fragment: _NodeFragment) -> bool:
+        return (
+            isinstance(fragment.key, SingleKey)
+            and fragment.key._dotted
+            and (
+                not isinstance(fragment.item, Table)
+                or fragment.item.display_name is None
+            )
+        )
+
+    @staticmethod
+    def _destination_fragment_key(
+        fragment: _NodeFragment,
+        target_parts: list[SingleKey],
+    ) -> Key:
+        source_key = fragment.key
+        return _clone_key_like(source_key, target_parts[-1])
+
+    @staticmethod
+    def _fragment_prefixes(
+        fragments: list[_NodeFragment],
+    ) -> dict[int, list[tuple[Key | None, Item]]]:
+        prefixes = {}
+        for fragment in fragments:
+            prefix_container, start, end = fragment.header_prefix_range()
+            prefixes[id(fragment)] = prefix_container.body[start:end]
+        return prefixes
+
+    def _preserve_moved_spacing(
+        self,
+        destination_container: Container,
+        fragment: _NodeFragment,
+        prefix: list[tuple[Key | None, Item]],
+        blank_lines: int,
+        insert_at: int,
+    ) -> None:
+        if blank_lines <= 0:
+            return
+
+        previous_destination = self._previous_rendered_item(
+            destination_container,
+            insert_at,
+        )
+        if previous_destination is not None and not prefix:
+            previous_destination.trivia.trail += "\n" * blank_lines
+        else:
+            target_item = fragment.item
+            if isinstance(target_item, AoT) and target_item.body:
+                target_item = target_item.body[0]
+
+            target_item.trivia.indent += "\n" * blank_lines
+
+    @staticmethod
+    def _source_spacing(
+        fragments: list[_NodeFragment],
+        prefixes: dict[int, list[tuple[Key | None, Item]]],
+    ) -> dict[int, int]:
+        spacing = {}
+        for fragment in fragments:
+            container, start, _end = fragment.header_prefix_range()
+            source_index = start - 1
+            while source_index >= 0 and isinstance(
+                container.body[source_index][1],
+                (Null, Whitespace),
+            ):
+                source_index -= 1
+
+            if source_index < 0:
+                spacing[id(fragment)] = 0
+                continue
+
+            source_item = container.body[source_index][1]
+            spacing[id(fragment)] = max(
+                0,
+                source_item.trivia.trail.count("\n") - 1,
+            )
+
+        return spacing
+
+    def _extract_fragments(
+        self,
+        fragments: list[_NodeFragment],
+    ) -> dict[int, list[tuple[Key | None, Item]]]:
+        prefixes: dict[int, list[tuple[Key | None, Item]]] = {}
+        for fragment in sorted(
+            fragments,
+            key=lambda current: (id(current.container), current.index),
+            reverse=True,
+        ):
+            header_container, prefix_start, prefix_end = fragment.header_prefix_range()
+            prefix = header_container.body[prefix_start:prefix_end]
+            prefixes[id(fragment)] = [
+                (key, copy.copy(item)) for key, item in prefix
+            ]
+            self._null_unindexed_entries(header_container, prefix)
+            fragment.container._remove_at(fragment.index)
+
+        return prefixes
+
+    @staticmethod
+    def _null_unindexed_entries(
+        container: Container,
+        entries: list[tuple[Key | None, Item]],
+    ) -> None:
+        for entry_key, entry_item in entries:
+            for index, (body_key, body_item) in enumerate(container.body):
+                if body_key is entry_key and body_item is entry_item:
+                    container.body[index] = (None, Null())
+                    break
+
+    def _prune_fragment_chains(self, fragments: list[_NodeFragment]) -> None:
+        for fragment in fragments:
+            self._prune_empty_super_tables(fragment.chain)
+            for _container, owner, _key in fragment.chain:
+                _sync_owner(owner if isinstance(owner, Table) else None)
+
+    @staticmethod
+    def _invalidate_moved_item(
+        item: Item,
+        target_parts: list[SingleKey],
+        source_key_dotted: bool,
+        source_key_name: str,
+    ) -> None:
+        if isinstance(item, Table):
+            item.name = target_parts[-1].key
+            if not source_key_dotted:
+                target_name = ".".join(part.as_string() for part in target_parts)
+                source_name = item.display_name or source_key_name
+                item.display_name = target_name
+                _relocate_display_names(item, source_name, target_name)
+        elif isinstance(item, AoT):
+            item.name = (
+                target_parts[-2].key
+                if len(target_parts) > 1
+                else target_parts[-1].key
+            )
+            full_name = ".".join(part.as_string() for part in target_parts)
+            for table in item.body:
+                table.name = target_parts[-1].key
+                table.display_name = full_name
+
+        if isinstance(item, Table) and source_key_dotted:
+            item.invalidate_display_name()
+
+    def _insert_moved_item(
+        self,
+        container: Container,
+        key: SingleKey,
+        item: Item,
+        insert_at: int,
+    ) -> None:
+        if isinstance(item, (Table, AoT)):
+            gap_index = insert_at
+            while gap_index > 0 and isinstance(
+                container.body[gap_index - 1][1],
+                Null,
+            ):
+                gap_index -= 1
+            if gap_index > 0 and isinstance(
+                container.body[gap_index - 1][1],
+                Whitespace,
+            ):
+                container.body[gap_index - 1][1]._s = "\n"
+            if isinstance(item, Table) and item.value.body:
+                last_index = len(item.value.body)
+                while last_index > 0 and isinstance(
+                    item.value.body[last_index - 1][1],
+                    Whitespace,
+                ):
+                    item.value.body[last_index - 1][1].s = "\n"
+                    last_index -= 1
+
+        if insert_at < len(container.body):
+            previous_item = self._previous_rendered_item(container, insert_at)
+            if previous_item is not None and not (
+                isinstance(previous_item, Whitespace)
+                or ends_with_whitespace(previous_item)
+                or isinstance(item, (AoT, Table))
+                or "\n" in previous_item.trivia.trail
+            ):
+                previous_item.trivia.trail += "\n"
+
+            for mapped_key, mapped_index in list(container._map.items()):
+                if isinstance(mapped_index, tuple):
+                    container._map[mapped_key] = tuple(
+                        value + 1 if value >= insert_at else value
+                        for value in mapped_index
+                    )
+                elif mapped_index >= insert_at:
+                    container._map[mapped_key] = mapped_index + 1
+
+            if key in container._map:
+                current_idx = container._map[key]
+                if not isinstance(current_idx, tuple):
+                    current_idx = (current_idx,)
+                container._map[key] = (*current_idx, insert_at)
+                container._out_of_order_keys.add(key)
+            else:
+                container._map[key] = insert_at
+
+            container._body.insert(insert_at, (key, item))
+            dict.__setitem__(container, key.key, item.value)
+        else:
+            previous_item = self._previous_rendered_item(container, insert_at)
+            if (
+                isinstance(item, (AoT, Table))
+                and isinstance(previous_item, (Table, AoT))
+                and not ends_with_whitespace(previous_item)
+            ):
+                previous_item.append(None, Whitespace("\n"))
+            container._raw_append(key, item)
+
+        if item.is_table():
+            container._table_keys.append(key)
+
+    def _insert_prefix(
+        self,
+        container: Container,
+        prefix: list[tuple[Key | None, Item]],
+        item_index: int,
+    ) -> None:
+        if not prefix:
+            return
+
+        previous_item = self._previous_rendered_item(container, item_index)
+        if previous_item is not None and "\n" not in previous_item.trivia.trail:
+            first_comment = prefix[0][1]
+            first_comment.trivia.indent = "\n"
+
+        for offset, (_key, comment) in enumerate(prefix):
+            container._body.insert(item_index + offset, (None, comment))
+
+    @staticmethod
+    def _previous_rendered_item(container: Container, index: int) -> Item | None:
+        for current_index in range(index - 1, -1, -1):
+            item = container.body[current_index][1]
+            if not isinstance(item, Null):
+                return item
+
+        return None
+
+    def _prune_empty_super_tables(
+        self,
+        chain: list[tuple[Container, Item | None, Key | None]],
+    ) -> None:
+        for container, owner, key in reversed(chain[1:]):
+            if (
+                not isinstance(owner, Table)
+                or not owner.is_super_table()
+                or len(owner._value) > 0
+                or not isinstance(key, Key)
+            ):
+                continue
+
+            index = next(
+                (
+                    index
+                    for index, (body_key, body_item) in enumerate(container.body)
+                    if body_key is key and body_item is owner
+                ),
+                None,
+            )
+            if index is not None:
+                container._remove_at(index)
 
     def _insert_after(
         self, key: Key | str, other_key: Key | str, item: Any
