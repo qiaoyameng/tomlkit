@@ -200,6 +200,24 @@ class KeyAlreadyPresent(TOMLKitError):
         super().__init__(message)
 
 
+class KeySortError(TOMLKitError):
+    """
+    A requested key order cannot be applied without changing the
+    semantics of the document, e.g. because a plain key would have to
+    move below a table header it does not belong to.
+    """
+
+    def __init__(self, key: object) -> None:
+        key = getattr(key, "key", key)
+        message = (
+            f'Cannot sort key "{key}" into the requested position: doing so '
+            "would move it across a table header and change the semantics "
+            "of the document"
+        )
+
+        super().__init__(message)
+
+
 class InvalidControlChar(ParseError):
     def __init__(self, line: int, col: int, char: int, type: str) -> None:
         display_code = "\\u00"

@@ -1815,6 +1815,25 @@ class AbstractTable(Item, _CustomDict):  # type: ignore[type-arg]
 
         return self
 
+    def sort_keys(
+        self: AT,
+        key_order: Iterable[str | Key] | None = None,
+        recursive: bool = False,
+    ) -> AT:
+        """
+        Sort the keys of this table in place, leaving every other byte of
+        the document untouched. See
+        :meth:`tomlkit.container.Container.sort_keys`.
+        """
+        self._value.sort_keys(key_order=key_order, recursive=recursive)
+
+        dict.clear(self)
+        for k, v in self._value.body:
+            if k is not None:
+                dict.__setitem__(self, k.key, v)
+
+        return self
+
     def item(self, key: Key | str) -> Item | OutOfOrderTableProxy:
         return self._value.item(key)
 

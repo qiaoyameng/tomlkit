@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import math
 
+from collections.abc import Iterable
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 from typing import Any
@@ -15,6 +16,7 @@ from tomlkit._compat import decode
 from tomlkit._types import _CustomDict
 from tomlkit._utils import merge_dicts
 from tomlkit.exceptions import KeyAlreadyPresent
+from tomlkit.exceptions import KeySortError
 from tomlkit.exceptions import NonExistentKey
 from tomlkit.exceptions import TOMLKitError
 from tomlkit.items import AoT
@@ -30,6 +32,78 @@ from tomlkit.items import item as _item
 
 
 _NOT_SET = object()
+
+
+class _KeySortPlan:
+    """A validated, not yet applied reordering of a container's body."""
+
+    __slots__ = ("header", "slots", "separators", "footer")
+
+    def __init__(self) -> None:
+        # trivia anchored before the first slot and after the last one
+        self.header: list[tuple[Key | None, Item]] = []
+        self.footer: list[tuple[Key | None, Item]] = []
+        # (entry, prefix, suffix) per slot, in their new order
+        self.slots: list[
+            tuple[
+                tuple[Key | None, Item],
+                list[tuple[Key | None, Item]],
+                list[tuple[Key | None, Item]],
+            ]
+        ] = []
+        # blank lines anchored between two slots
+        self.separators: list[list[tuple[Key | None, Item]]] = []
+
+
+def _is_blank_line(item: Item) -> bool:
+    return isinstance(item, Whitespace) and "\n" in item.as_string()
+
+
+def _split_trivia_run(
+    run: list[tuple[Key | None, Item]],
+) -> tuple[list[tuple[Key | None, Item]], list[tuple[Key | None, Item]]]:
+    """Split a run of trivia items at its last blank line.
+
+    The part after the last blank line (typically the comment group
+    directly above the next key) is returned separately from the rest.
+    """
+    for i in range(len(run) - 1, -1, -1):
+        if _is_blank_line(run[i][1]):
+            return run[: i + 1], run[i + 1 :]
+    return [], run
+
+
+def _drain_trailing_blank_lines(container: Container) -> list[tuple[Key | None, Item]]:
+    """Remove and return the blank lines at the end of a container's body."""
+    drained = []
+    body = container.body
+    while body:
+        key, item = body[-1]
+        if key is not None or not _is_blank_line(item):
+            break
+        drained.append(body.pop())
+    drained.reverse()
+    return drained
+
+
+def _fragments_would_merge(
+    first: tuple[Key | None, Item], other: tuple[Key | None, Item]
+) -> bool:
+    """Whether the parser would merge two adjacent table fragments into a
+    single entry on re-parse: same key, both plain (non-dotted) tables and
+    the later one a super table.
+    """
+    key, other_key = first[0], other[0]
+    if key is None or other_key is None or key != other_key:
+        return False
+    if key.is_dotted() or other_key.is_dotted():
+        return False
+    item, other_item = first[1], other[1]
+    return (
+        isinstance(item, Table)
+        and isinstance(other_item, Table)
+        and other_item.is_super_table()
+    )
 
 
 class Container(_CustomDict):  # type: ignore[type-arg]
@@ -516,6 +590,324 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         dict.__delitem__(self, key.key)
 
         return self
+
+    def sort_keys(
+        self,
+        key_order: Iterable[str | Key] | None = None,
+        recursive: bool = False,
+    ) -> Container:
+        """
+        Sort the keys of this container in place, leaving every other
+        byte of the document untouched.
+
+        Each key moves together with the comment and whitespace lines
+        directly above it, and no key is ever moved across a table (or
+        array of tables) header, which would change which table it
+        belongs to. The elements of an array of tables are never
+        reordered.
+
+        :param key_order: the desired order of the leading keys, as key
+            names or :class:`Key` instances. Keys not listed keep their
+            original relative order and follow the listed ones. If not
+            given, all keys are sorted alphabetically.
+        :param recursive: if ``True``, apply the same ordering to every
+            sub-table and to every element of arrays of tables.
+        :raises KeySortError: if the requested order cannot be realized
+            without changing the semantics of the document; the document
+            is left untouched in that case.
+        """
+        if key_order is None:
+            positions = None
+        else:
+            positions = {}
+            for i, name in enumerate(key_order):
+                if isinstance(name, Key):
+                    name = name.key
+                positions.setdefault(name, i)
+
+        plans: list[tuple[Container, _KeySortPlan]] = []
+        # Blank lines trailing a table are drained into the separator of
+        # the table's slot while planning; if any (sub-)container rejects
+        # the requested order, put them back so the document is left
+        # exactly as it was.
+        drained: list[tuple[Container, list[tuple[Key | None, Item]]]] = []
+        try:
+            self._plan_key_sort(positions, recursive, plans, drained)
+        except Exception:
+            for container, blank_lines in reversed(drained):
+                container.body.extend(blank_lines)
+            raise
+        for container, plan in reversed(plans):
+            container._apply_key_sort(plan)
+
+        return self
+
+    def _sort_entry_rank(self, key: Key, item: Item) -> int:
+        """
+        Rank of a body entry for sorting: 0 for entries that render inline
+        (plain values and dotted keys), 1 for dotted keys that render both
+        inline values and a ``[table]`` header, 2 for entries that render
+        a header (tables and arrays of tables). A legal reordering keeps
+        these ranks non-decreasing: inline content landing after a header
+        would be captured by that header when re-parsing.
+        """
+        if isinstance(item, AoT):
+            return 2
+        if isinstance(item, Table):
+            if key.is_dotted():
+                return 1 if self._renders_table_header(item) else 0
+            return 2
+        return 0
+
+    def _plan_key_sort(
+        self,
+        positions: dict[str, int] | None,
+        recursive: bool,
+        plans: list[tuple[Container, _KeySortPlan]],
+        drained: list[tuple[Container, list[tuple[Key | None, Item]]]],
+    ) -> None:
+        # Split the body into keyed entries and the trivia runs between
+        # them (runs[i] sits before entries[i]; the last run is trailing).
+        entries: list[tuple[Key | None, Item]] = []
+        runs: list[list[tuple[Key | None, Item]]] = []
+        run: list[tuple[Key | None, Item]] = []
+        for entry in self._body:
+            if entry[0] is None:
+                run.append(entry)
+            else:
+                runs.append(run)
+                run = []
+                entries.append(entry)
+        runs.append(run)
+
+        n = len(entries)
+        slot_items: list[Item] = [item for _, item in entries]
+        if n > 1:
+            # Comma-bearing whitespace only occurs between the entries of
+            # an inline table, where every trivia run is a separator that
+            # must stay between two slots.
+            inline = any(
+                key is None and isinstance(item, Whitespace) and "," in item.as_string()
+                for key, item in self._body
+            )
+            priorities: list[Any] = []
+            for i, (key, _) in enumerate(entries):
+                assert key is not None
+                if positions is None:
+                    priorities.append(key.key)
+                elif key.key in positions:
+                    priorities.append((0, positions[key.key]))
+                else:
+                    priorities.append((1, i))
+            # sorted() is stable: fragments of an out-of-order key and
+            # keys not mentioned in key_order keep their relative order.
+            order = sorted(range(n), key=lambda i: priorities[i])
+            if order != list(range(n)):
+                ranks = [
+                    self._sort_entry_rank(key, item)  # type: ignore[arg-type]
+                    for key, item in entries
+                ]
+                new_ranks = [ranks[i] for i in order]
+                mixed = [i for i in range(n) if ranks[i] == 1]
+                violation = next(
+                    (
+                        order[pos]
+                        for pos in range(1, len(order))
+                        if new_ranks[pos] < new_ranks[pos - 1]
+                    ),
+                    None,
+                )
+                if violation is None and [i for i in order if ranks[i] == 1] != mixed:
+                    violation = next(i for i in order if ranks[i] == 1)
+                if violation is not None:
+                    raise KeySortError(entries[violation][0])
+
+                # Distribute the trivia runs. The comment group directly
+                # above a key (no blank line in between) belongs to that
+                # key and travels with it. Blank lines are separators
+                # anchored between two slots, and any earlier comment
+                # groups belong to the preceding key. Everything before
+                # the first key that is not directly attached to it (e.g.
+                # the document header comment) stays on top; the trailing
+                # run stays at the end.
+                header: list[tuple[Key | None, Item]] = []
+                prefixes: list[list[tuple[Key | None, Item]]] = [
+                    [] for _ in range(n)
+                ]
+                suffixes: list[list[tuple[Key | None, Item]]] = [
+                    [] for _ in range(n)
+                ]
+                # separators[i] holds the blank lines anchored at the
+                # boundary after slot i
+                separators: list[list[tuple[Key | None, Item]]] = [
+                    [] for _ in range(n)
+                ]
+                footer = runs[n]
+                for i in range(n):
+                    if inline:
+                        head, tail = runs[i], []
+                    else:
+                        head, tail = _split_trivia_run(runs[i])
+                    prefixes[i].extend(tail)
+                    for trivia_entry in head:
+                        if inline or _is_blank_line(trivia_entry[1]):
+                            (separators[i - 1] if i else header).append(trivia_entry)
+                        else:
+                            (suffixes[i - 1] if i else header).append(trivia_entry)
+
+                # Group same-key table fragments that become adjacent in
+                # the new order and that the parser would merge into a
+                # single entry on re-parse.
+                groups: list[list[int]] = []
+                for idx in order:
+                    if groups and _fragments_would_merge(
+                        entries[groups[-1][0]], entries[idx]
+                    ):
+                        groups[-1].append(idx)
+                    else:
+                        groups.append([idx])
+                merged_indices = {
+                    idx for group in groups if len(group) > 1 for idx in group
+                }
+
+                # Blank lines trailing a table (or the last element of an
+                # array of tables) visually separate it from the next one;
+                # drain them into the anchored separator of the table's
+                # slot. Fragments about to be merged keep theirs inside
+                # the merged table.
+                for i, (_, item) in enumerate(entries):
+                    if i in merged_indices:
+                        continue
+                    container = None
+                    if isinstance(item, AoT):
+                        if item.body:
+                            container = item.body[-1].value
+                    elif isinstance(item, Table):
+                        container = item.value
+                    if container is None:
+                        continue
+                    blank_lines = _drain_trailing_blank_lines(container)
+                    if not blank_lines:
+                        continue
+                    drained.append((container, blank_lines))
+                    if i < n - 1:
+                        separators[i] = blank_lines + separators[i]
+                    else:
+                        footer = blank_lines + footer
+
+                # Build the slots of the new body, merging fragment groups
+                # into a single table the way the parser would.
+                plan = _KeySortPlan()
+                plan.header = header
+                plan.footer = footer
+                pos = 0
+                for group in groups:
+                    first = group[0]
+                    if len(group) == 1:
+                        slot_entry = entries[first]
+                        slot_suffix = suffixes[first]
+                    else:
+                        slot_entry = self._merge_table_fragments(
+                            group, entries, prefixes, suffixes, separators, pos
+                        )
+                        slot_suffix = suffixes[group[-1]]
+                        blank_lines = _drain_trailing_blank_lines(
+                            slot_entry[1].value  # type: ignore[union-attr]
+                        )
+                        if blank_lines:
+                            last = group[-1]
+                            if last < n - 1:
+                                separators[last] = blank_lines + separators[last]
+                            else:
+                                plan.footer = blank_lines + plan.footer
+                    plan.slots.append((slot_entry, prefixes[first], slot_suffix))
+                    pos += len(group)
+                pos = 0
+                for group in groups[:-1]:
+                    pos += len(group)
+                    plan.separators.append(separators[pos - 1])
+                plans.append((self, plan))
+                slot_items = [entry[1] for entry, _, _ in plan.slots]
+
+        if recursive:
+            for item in slot_items:
+                if isinstance(item, AoT):
+                    for table in item.body:
+                        table.value._plan_key_sort(positions, recursive, plans, drained)
+                elif isinstance(item, Table):
+                    item.value._plan_key_sort(positions, recursive, plans, drained)
+
+    def _merge_table_fragments(
+        self,
+        group: list[int],
+        entries: list[tuple[Key | None, Item]],
+        prefixes: list[list[tuple[Key | None, Item]]],
+        suffixes: list[list[tuple[Key | None, Item]]],
+        separators: list[list[tuple[Key | None, Item]]],
+        pos: int,
+    ) -> tuple[Key | None, Item]:
+        """Combine adjacent same-key table fragments into a single table,
+        the way the parser would merge them on re-parse. The trivia that
+        sat between the fragments moves into the merged table's container
+        so the rendering is unchanged. Nothing is mutated: the merged
+        table is a new object sharing the fragments' items.
+        """
+        key, first_table = entries[group[0]]
+        assert isinstance(first_table, Table)
+        body = list(first_table.value.body)
+        body += suffixes[group[0]]
+        for j, idx in enumerate(group[1:]):
+            fragment = entries[idx][1]
+            assert isinstance(fragment, Table)
+            body += separators[pos + j]
+            body += prefixes[idx]
+            body += fragment.value.body
+            if j < len(group) - 2:
+                body += suffixes[idx]
+        container = Container(self._parsed)
+        for k, v in body:
+            container._raw_append(k, v)
+        merged = Table(
+            container,
+            first_table.trivia,
+            first_table.is_aot_element(),
+            first_table.is_super_table(),
+            first_table.name,
+            first_table.display_name,
+        )
+        return key, merged
+
+    def _apply_key_sort(self, plan: _KeySortPlan) -> None:
+        """Apply a validated key-sort plan and rebuild the key map."""
+        body = list(plan.header)
+        for slot, (entry, prefix, suffix) in enumerate(plan.slots):
+            if slot:
+                body += plan.separators[slot - 1]
+            body += prefix
+            body.append(entry)
+            body += suffix
+        body += plan.footer
+
+        self._body = body
+        self._map = {}
+        self._table_keys = []
+        self._out_of_order_keys = set()
+        self._validation_cache.clear()
+        dict.clear(self)
+        for i, (key, item) in enumerate(body):
+            if key is None:
+                continue
+            current_idx = self._map.get(key)
+            if current_idx is None:
+                self._map[key] = i
+            else:
+                if not isinstance(current_idx, tuple):
+                    current_idx = (current_idx,)
+                self._map[key] = (*current_idx, i)
+                self._out_of_order_keys.add(key)
+            if item.is_table():
+                self._table_keys.append(key)
+            dict.__setitem__(self, key.key, item.value)
 
     def _insert_after(
         self, key: Key | str, other_key: Key | str, item: Any

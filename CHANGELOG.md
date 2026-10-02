@@ -1,5 +1,11 @@
 # Change Log
 
+## [Unreleased]
+
+### Added
+
+- Add `sort_keys()` to `TOMLDocument`, `Table` and `InlineTable`: sort the keys of a single table in place without reformatting the rest of the document. Each key moves together with its attached comments and whitespace, an optional key order can be specified (unlisted keys keep their relative order), and `recursive=True` applies the same ordering to sub-tables and array-of-table elements. The elements of an array of tables are never reordered, and an order that cannot be realized without changing the semantics of the document (e.g. moving a plain key below a table header) is rejected with the new `KeySortError`, leaving the document untouched.
+
 ## [0.15.1] - 2026-07-17
 
 ### Changed
