@@ -17,6 +17,7 @@ from tomlkit._utils import merge_dicts
 from tomlkit.exceptions import KeyAlreadyPresent
 from tomlkit.exceptions import NonExistentKey
 from tomlkit.exceptions import TOMLKitError
+from tomlkit.exceptions import UnparsedRegionEditError
 from tomlkit.items import AoT
 from tomlkit.items import Comment
 from tomlkit.items import Item
@@ -25,6 +26,7 @@ from tomlkit.items import Null
 from tomlkit.items import SingleKey
 from tomlkit.items import Table
 from tomlkit.items import Trivia
+from tomlkit.items import UnparsedNode
 from tomlkit.items import Whitespace
 from tomlkit.items import item as _item
 
@@ -483,6 +485,8 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         index = self._map.get(key)
         if index is None:
             raise NonExistentKey(key)
+        if isinstance(self._body[idx][1], UnparsedNode):
+            raise UnparsedRegionEditError(key)
         self._validation_cache.clear()
         self._body[idx] = (None, Null())
 
@@ -505,6 +509,12 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         idx = self._map.pop(key, None)
         if idx is None:
             raise NonExistentKey(key)
+
+        current_item = self._body[idx if isinstance(idx, int) else idx[0]][1]
+        if isinstance(current_item, UnparsedNode):
+            # Put the key back: a broken fragment must not be silently dropped.
+            self._map[key] = idx
+            raise UnparsedRegionEditError(key)
 
         self._validation_cache.clear()
         if isinstance(idx, tuple):
@@ -886,6 +896,8 @@ class Container(_CustomDict):  # type: ignore[type-arg]
 
         k, v = self._body[idx]
         assert k is not None
+        if isinstance(v, UnparsedNode):
+            raise UnparsedRegionEditError(k.key)
         # A dotted key renders its value inline (e.g. ``a.b = 1``), which is only
         # consistent with a super table. When the replacement value renders with
         # its own ``[header]`` instead (a non-super table, or an array of tables),

@@ -232,3 +232,25 @@ class ConvertError(TypeError, ValueError, TOMLKitError):
     It should be a TypeError, but due to historical reasons
     it needs to subclass ValueError as well.
     """
+
+
+class UnparsedRegionEditError(TOMLKitError):
+    """
+    Raised when an edit path resolves to an opaque node holding a fragment that
+    could not be parsed. Such regions must be corrected as text; they cannot be
+    silently replaced or removed through the normal item-editing API.
+    """
+
+    def __init__(self, key: object | None = None) -> None:
+        if key is None:
+            message = (
+                "This region contains a TOML syntax error and cannot be edited "
+                "until the fragment is corrected."
+            )
+        else:
+            message = (
+                f'Key "{key}" resolves to an unparsed region containing a syntax '
+                "error. Correct the fragment text before editing it."
+            )
+
+        super().__init__(message)

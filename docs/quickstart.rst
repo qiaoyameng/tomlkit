@@ -27,6 +27,31 @@ the content of TOML files and strings::
     >>> assert dumps(doc) == content
 
 
+Recovering from errors
+^^^^^^^^^^^^^^^^^^^^^^
+
+``parse()`` is strict and raises on the first syntax error. For editors that
+must keep working while a document is half-typed, use ``parse_recovery()``,
+which returns an editable document together with a list of diagnostics::
+
+    >>> from tomlkit import parse_recovery
+
+    >>> result = parse_recovery('good = 1\nbad = = 2\n[ok]\nv = 3\n')
+    >>> result.complete
+    True
+    >>> len(result.diagnostics)
+    1
+    >>> result.document["ok"]["v"]
+    3
+
+Broken fragments are stored verbatim (original text and character span) in
+opaque ``UnparsedNode`` objects. They survive ``dumps()`` untouched, but edit
+paths that resolve to them raise ``UnparsedRegionEditError``. When no safe
+resynchronization point can be found (for example an unterminated multiline
+string or a missing array bracket), the remaining text is kept as one unparsed
+region and ``result.complete`` is ``False``.
+
+
 Modifying
 ---------
 

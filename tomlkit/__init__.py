@@ -1,4 +1,6 @@
 from tomlkit.api import TOMLDocument
+from tomlkit.api import Diagnostic
+from tomlkit.api import RecoveryResult
 from tomlkit.api import aot
 from tomlkit.api import array
 from tomlkit.api import boolean
@@ -18,6 +20,7 @@ from tomlkit.api import load
 from tomlkit.api import loads
 from tomlkit.api import nl
 from tomlkit.api import parse
+from tomlkit.api import parse_recovery
 from tomlkit.api import register_encoder
 from tomlkit.api import string
 from tomlkit.api import table
@@ -25,11 +28,14 @@ from tomlkit.api import time
 from tomlkit.api import unregister_encoder
 from tomlkit.api import value
 from tomlkit.api import ws
+from tomlkit.items import UnparsedNode
 
 
 __version__ = "0.15.1"
 __all__ = [
     "TOMLDocument",
+    "Diagnostic",
+    "RecoveryResult",
     "aot",
     "array",
     "boolean",
@@ -49,10 +55,12 @@ __all__ = [
     "loads",
     "nl",
     "parse",
+    "parse_recovery",
     "register_encoder",
     "string",
     "table",
     "time",
+    "UnparsedNode",
     "unregister_encoder",
     "value",
     "ws",

@@ -613,6 +613,78 @@ class Comment(Item):
         return f"{self._trivia.indent}{decode(self._trivia.comment)}"
 
 
+class UnparsedNode(Item):
+    """
+    An opaque node holding a source fragment that the recovery parser could not
+    interpret. The fragment is preserved verbatim (``raw``) together with its
+    half-open character span in the original source. It is *not* a value and
+    cannot be edited through the normal item API; attempts to mutate it raise
+    :class:`~tomlkit.exceptions.UnparsedRegionEditError`.
+    """
+
+    def __init__(
+        self,
+        raw: str,
+        start: int,
+        end: int,
+        trivia: Trivia | None = None,
+    ) -> None:
+        super().__init__(trivia or Trivia())
+        self._raw = raw
+        self._start = start
+        self._end = end
+
+    @property
+    def raw(self) -> str:
+        """The original, unmodified source text of the broken fragment."""
+        return self._raw
+
+    @property
+    def span(self) -> tuple[int, int]:
+        """The half-open ``[start, end)`` character interval in the source."""
+        return (self._start, self._end)
+
+    @property
+    def start(self) -> int:
+        return self._start
+
+    @property
+    def end(self) -> int:
+        return self._end
+
+    @property
+    def discriminant(self) -> int:
+        return 99
+
+    def as_string(self) -> str:
+        return self._raw
+
+    @property
+    def value(self) -> Any:
+        return self
+
+    def unwrap(self) -> Any:
+        from tomlkit.exceptions import UnparsedRegionEditError
+
+        raise UnparsedRegionEditError()
+
+    def __getitem__(self, key: Any) -> Any:
+        from tomlkit.exceptions import UnparsedRegionEditError
+
+        raise UnparsedRegionEditError(key)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        from tomlkit.exceptions import UnparsedRegionEditError
+
+        raise UnparsedRegionEditError(key)
+
+    def __repr__(self) -> str:
+        return f"<UnparsedNode {self._raw!r}>"
+
+    def _getstate(self, protocol: int = 3) -> tuple[object, ...]:
+        return (self._raw, self._start, self._end, self._trivia)
+
+
 class Integer(Item, _CustomInt):
     """
     An integer literal.

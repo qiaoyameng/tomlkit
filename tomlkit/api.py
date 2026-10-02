@@ -35,6 +35,9 @@ from tomlkit.items import Trivia
 from tomlkit.items import Whitespace
 from tomlkit.items import item as item
 from tomlkit.parser import Parser
+from tomlkit.recovery import Diagnostic
+from tomlkit.recovery import RecoveryResult
+from tomlkit.recovery import parse_recovery
 from tomlkit.toml_document import TOMLDocument as TOMLDocument
 
 
