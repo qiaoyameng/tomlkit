@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import math
 
+from collections.abc import Iterable
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 from typing import Any
@@ -516,6 +517,221 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         dict.__delitem__(self, key.key)
 
         return self
+
+    def move(
+        self, source: Iterable[str | Key], target: Iterable[str | Key]
+    ) -> Container:
+        """Move a node (value, table or array of tables) to another location.
+
+        Both ``source`` and ``target`` are given as a sequence of key
+        segments, one per nesting level, so a key whose name literally
+        contains a dot (e.g. ``"tls.cert"``) is a single segment and is never
+        mistaken for a dotted path.  The last segment of ``target`` is the
+        key the node will have at its new location; missing intermediate
+        tables are created as implicit (super) tables.
+
+        The comment block directly attached above the node (no blank line in
+        between) and its end-of-line comment move along with it, while
+        comment paragraphs separated from the node by a blank line stay in
+        the source table.
+
+        The operation is validated in full before anything is mutated: if
+        the source does not exist, the target key already exists, the target
+        lies inside the moved node itself, or any path segment is not
+        resolvable, an error is raised and the document is left untouched.
+
+        :Example:
+
+        >>> # move ``tls`` from ``[server]`` to ``[security]``
+        >>> doc.move(["server", "tls"], ["security", "tls"])
+        """
+        src = self._normalize_move_path(source, "source")
+        dst = self._normalize_move_path(target, "target")
+
+        # -- validation phase: resolve everything without mutating --
+        # Path resolution tracks a set of candidate containers so that
+        # out-of-order tables (one logical table split over several headers)
+        # can be traversed as long as each step stays unambiguous.
+        candidates = [self]
+        for seg in src[:-1]:
+            candidates = self._move_descend(candidates, seg)
+            if not candidates:
+                raise NonExistentKey(seg)
+        src_key = src[-1]
+        locations = [
+            (container, container._map[src_key])
+            for container in candidates
+            if src_key in container._map
+        ]
+        if not locations:
+            raise NonExistentKey(src_key)
+        if len(locations) > 1:
+            raise TOMLKitError(
+                f"Cannot move {src_key.key!r}: it is defined by several "
+                "table headers"
+            )
+        src_parent, src_idx = locations[0]
+        if isinstance(src_idx, tuple):
+            src_indices: tuple[int, ...] = src_idx
+        else:
+            src_indices = (src_idx,)
+        src_fragments = [src_parent._body[i][1] for i in src_indices]
+        if len(src_fragments) > 1:
+            if not all(
+                isinstance(fragment, Table) and fragment.is_super_table()
+                for fragment in src_fragments
+            ):
+                raise TOMLKitError(
+                    f"Cannot move out-of-order table {src_key.key!r}: "
+                    "it is defined by several table headers"
+                )
+        src_item = src_fragments[0]
+        src_body_key = src_parent._body[src_indices[0]][0]
+        assert src_body_key is not None
+
+        dst_candidates = [self]
+        missing: list[SingleKey] = []
+        for seg in dst[:-1]:
+            if missing:
+                missing.append(seg)
+                continue
+            nxt = []
+            for container in dst_candidates:
+                idx = container._map.get(seg)
+                if idx is None:
+                    continue
+                for i in idx if isinstance(idx, tuple) else (idx,):
+                    item = container._body[i][1]
+                    if any(item is fragment for fragment in src_fragments):
+                        raise TOMLKitError(
+                            "Cannot move a node into its own descendant"
+                        )
+                    if not isinstance(item, Table):
+                        raise TOMLKitError(
+                            f"Cannot move into {seg.key!r}: it is not a table"
+                        )
+                    nxt.append(item.value)
+            if not nxt:
+                missing.append(seg)
+                continue
+            dst_candidates = nxt
+        if len(dst_candidates) > 1:
+            raise TOMLKitError(
+                "Cannot move: the target path is ambiguous because it "
+                "crosses an out-of-order table"
+            )
+        dst_parent = dst_candidates[0]
+
+        dst_key = dst[-1]
+        if not missing and dst_parent._map.get(dst_key) is not None:
+            raise KeyAlreadyPresent(dst_key)
+
+        # -- collect the comment block attached directly above the node --
+        comments: list[tuple[Container, int]] = []
+        for src_i in src_indices:
+            block = _move_attached_comments(src_parent, src_i)
+            block.reverse()
+            comments.extend(block)
+        comment_text = "".join(
+            comment_container._body[comment_idx][1].as_string()
+            for comment_container, comment_idx in comments
+        )
+        if comment_text and not comment_text.endswith("\n"):
+            comment_text += "\n"
+
+        # -- mutation phase --
+        for comment_container, comment_idx in comments:
+            comment_container._body[comment_idx] = (None, Null())
+        src_parent.remove(src_key)
+
+        if len(src_fragments) > 1:
+            # Dotted keys sharing a prefix (``tls.enabled``, ``tls.version``)
+            # store one implicit super table per line; merge their children
+            # into the first fragment so the node moves as a whole.  The
+            # same merge was validated when the document was parsed, so it
+            # cannot fail here.
+            for fragment in src_fragments[1:]:
+                for k, v in fragment.value.body:
+                    src_item.value.append(k, v)
+
+        for seg in missing:
+            table = Table(Container(), Trivia(), False, is_super_table=True)
+            dst_parent.append(seg, table)
+            dst_parent = table.value
+
+        if dst_key == src_body_key:
+            # Reuse the original key object so quoting, separator and the
+            # dotted flag (inline rendering of dotted-key tables) survive.
+            final_key = src_body_key
+        else:
+            final_key = SingleKey(dst_key.key)
+            final_key._dotted = src_body_key.is_dotted()
+            if isinstance(src_item, (Table, AoT)):
+                src_item.name = final_key.key
+
+        dst_parent.append(final_key, src_item)
+
+        if comment_text:
+            holder = _move_trivia_holder(src_item, final_key)
+            indent = holder.trivia.indent
+            ws_len = 0
+            while ws_len < len(indent) and indent[ws_len] in " \t\r\n":
+                ws_len += 1
+            # keep leading blank lines before the re-attached comment block
+            holder.trivia.indent = indent[:ws_len] + comment_text + indent[ws_len:]
+
+        return self
+
+    @staticmethod
+    def _normalize_move_path(
+        path: Iterable[str | Key], role: str
+    ) -> list[SingleKey]:
+        if isinstance(path, (str, Key)):
+            raise TypeError(
+                f"The {role} path must be a sequence of key segments, "
+                f"not a single {type(path).__name__}"
+            )
+        segments: list[SingleKey] = []
+        for seg in path:
+            if isinstance(seg, Key):
+                if seg.is_multi():
+                    raise ValueError(
+                        "A path segment must be a single key, "
+                        f"not the dotted key {seg.as_string()!r}"
+                    )
+                segments.append(SingleKey(seg.key))
+            elif isinstance(seg, str):
+                segments.append(SingleKey(seg))
+            else:
+                raise TypeError(
+                    f"Path segments must be strings or keys, not {type(seg).__name__}"
+                )
+        if not segments:
+            raise ValueError(f"The {role} path must not be empty")
+        return segments
+
+    @staticmethod
+    def _move_descend(
+        containers: list[Container], seg: SingleKey
+    ) -> list[Container]:
+        """Resolve one path segment into the next candidate containers.
+
+        Out-of-order tables fan out into one container per fragment; a
+        non-table item anywhere on the path makes the whole move illegal.
+        """
+        nxt: list[Container] = []
+        for container in containers:
+            idx = container._map.get(seg)
+            if idx is None:
+                continue
+            for i in idx if isinstance(idx, tuple) else (idx,):
+                item = container._body[i][1]
+                if not isinstance(item, Table):
+                    raise TOMLKitError(
+                        f"Cannot move through {seg.key!r}: it is not a table"
+                    )
+                nxt.append(item.value)
+        return nxt
 
     def _insert_after(
         self, key: Key | str, other_key: Key | str, item: Any
@@ -1271,6 +1487,80 @@ def ends_with_whitespace(it: Any) -> bool:
         previous = it.value._previous_item()
         return previous is not None and ends_with_whitespace(previous)
     return isinstance(it, AoT) and len(it) > 0 and ends_with_whitespace(it[-1])
+
+
+def _table_renders_own_header(table: Table, key: Key | None) -> bool:
+    """Mirror of the header condition in ``Container._render_table``."""
+    if not table.is_super_table():
+        return True
+    if key is not None and key.is_dotted():
+        return False
+    body = table.value.body
+    if any(not isinstance(v, (Table, AoT, Whitespace, Null)) for _, v in body):
+        return True
+    return any(
+        k is not None and k.is_dotted() for k, v in body if isinstance(v, Table)
+    )
+
+
+def _move_trivia_holder(item: Item, key: Key | None) -> Item:
+    """Find the item whose ``trivia.indent`` is rendered first.
+
+    When a moved node carries its leading comment block along, the block is
+    folded into the indent of whatever renders first: the node itself for
+    plain values and tables with their own header, the first element of an
+    array of tables, or the first rendered descendant of an implicit
+    (super) table, which never renders its own indent.
+    """
+    if isinstance(item, AoT):
+        return item.body[0] if item.body else item
+    if isinstance(item, Table):
+        if _table_renders_own_header(item, key):
+            return item
+        for k, v in item.value.body:
+            if k is None:
+                continue
+            return _move_trivia_holder(v, k)
+    return item
+
+
+def _move_attached_comments(
+    container: Container, idx: int
+) -> list[tuple[Container, int]]:
+    """Collect the comment block rendered directly above a body entry.
+
+    Follows the rendering order backwards from the entry at ``idx``:
+    contiguous comments are collected until a blank line (whitespace) or a
+    plain value stops the scan.  A preceding table or array of tables is
+    descended into, because a comment that trails its body still renders
+    directly above the entry -- e.g. the comment before ``[[server.a]]``
+    when ``[server.b]`` was the previously open section.  Returns
+    ``(container, body index)`` pairs in reverse rendering order.
+    """
+    collected: list[tuple[Container, int]] = []
+    current, i = container, idx
+    while True:
+        j = i - 1
+        while j >= 0 and isinstance(current._body[j][1], Null):
+            j -= 1
+        if j < 0:
+            return collected
+        key, value = current._body[j]
+        if key is None:
+            if isinstance(value, Comment):
+                collected.append((current, j))
+                i = j
+                continue
+            # whitespace: a blank line separates the paragraph from the node
+            return collected
+        if isinstance(value, AoT):
+            if not value.body:
+                return collected
+            value = value.body[-1]
+        if isinstance(value, Table):
+            current, i = value.value, len(value.value.body)
+            continue
+        return collected
 
 
 def _equal_with_nan(left: Any, right: Any) -> bool:

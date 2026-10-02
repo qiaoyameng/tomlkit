@@ -1,5 +1,11 @@
 # Change Log
 
+## Unreleased
+
+### Added
+
+- Add `Container.move(source, target)` (also available on `TOMLDocument`) to relocate a node — a plain value, a table, an array of tables or an implicit table formed by dotted keys — to another place in the document. Both paths are given as sequences of key segments, so keys literally containing dots are never mistaken for dotted paths. The comment block directly attached above the node and its end-of-line comment move along with it, while blank-line-separated comment paragraphs stay behind. Missing intermediate tables are created as implicit tables, table header paths and display names are fixed up, and the operation is fully validated before any mutation: an existing target key, a target inside the moved node itself, or an unresolvable path raises an error and leaves the document byte-for-byte unchanged.
+
 ## [0.15.1] - 2026-07-17
 
 ### Changed
