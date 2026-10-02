@@ -200,6 +200,10 @@ class KeyAlreadyPresent(TOMLKitError):
         super().__init__(message)
 
 
+class InvalidKeyOrderError(TOMLKitError):
+    """The requested key order cannot be represented without changing semantics."""
+
+
 class InvalidControlChar(ParseError):
     def __init__(self, line: int, col: int, char: int, type: str) -> None:
         display_code = "\\u00"

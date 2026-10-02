@@ -1687,3 +1687,184 @@ a.b = 1
     doc["z"] = 2
 
     assert doc.as_string() == "a.b = 1\nz = 2\n"
+
+
+def test_sort_keys_reorders_only_the_selected_table() -> None:
+    content = dedent(
+        '''\
+        # Document header
+        # stays fixed
+
+        z = 3
+
+        # quoted
+        "q" = 2
+        a = 1
+
+        [untouched]
+        z = 2
+        a = 1
+        '''
+    )
+    doc = parse(content)
+    original_value = doc.unwrap()
+
+    result = doc.sort_keys(["a", "q", "z"])
+
+    assert result is doc
+    assert doc.as_string() == dedent(
+        '''\
+        # Document header
+        # stays fixed
+
+        a = 1
+
+        # quoted
+        "q" = 2
+        z = 3
+
+        [untouched]
+        z = 2
+        a = 1
+        '''
+    )
+    assert parse(doc.as_string()).unwrap() == original_value
+    sorted_text = doc.as_string()
+    doc.sort_keys(["a", "q", "z"])
+    assert doc.as_string() == sorted_text
+
+
+def test_sort_keys_handles_dotted_explicit_and_array_tables_recursively() -> None:
+    content = dedent(
+        '''\
+        [service]
+        z = 3
+        a.b = 2
+        q = 4
+        a.c = 1
+
+        [[products]]
+        z = 2
+        a = 1
+
+        [[products]]
+        b = 3
+
+        [[other]]
+        z = 1
+        a = 2
+        '''
+    )
+    doc = parse(content)
+    original_value = doc.unwrap()
+
+    doc["service"].sort_keys(["a.b", "q", "z"])
+    doc["products"].sort_keys(["a", "z"], recursive=True)
+
+    expected = dedent(
+        '''\
+        [service]
+        a.b = 2
+        q = 4
+        z = 3
+        a.c = 1
+
+        [[products]]
+        a = 1
+        z = 2
+
+        [[products]]
+        b = 3
+
+        [[other]]
+        z = 1
+        a = 2
+        '''
+    )
+    assert doc.as_string() == expected
+    assert parse(doc.as_string()).unwrap() == original_value
+    sorted_text = doc.as_string()
+
+    doc["service"].sort_keys(["a.b", "q", "z"])
+    doc["products"].sort_keys(["a", "z"], recursive=True)
+    assert doc.as_string() == sorted_text
+
+
+def test_sort_keys_recurses_into_inline_tables_inside_arrays() -> None:
+    content = 'rows = [{z = 1, a = 2}, {y = 3, b = 4}]\n'
+    doc = parse(content)
+    original_value = doc.unwrap()
+
+    doc.sort_keys(["a", "b", "y", "z"], recursive=True)
+
+    assert (
+        doc.as_string()
+        == "rows = [{a = 2, z = 1}, {b = 4, y = 3}]\n"
+    )
+    assert parse(doc.as_string()).unwrap() == original_value
+    sorted_text = doc.as_string()
+    doc.sort_keys(["a", "b", "y", "z"], recursive=True)
+    assert doc.as_string() == sorted_text
+
+
+def test_sort_keys_can_reorganize_scattered_same_table() -> None:
+    content = dedent(
+        '''\
+        [service]
+        x = 1
+
+        [other]
+        y = 2
+
+        [service.child]
+        z = 3
+        '''
+    )
+    doc = parse(content)
+    original_value = doc.unwrap()
+
+    doc["service"].sort_keys(["child", "x"])
+
+    assert doc.as_string() == dedent(
+        '''\
+        [service.child]
+        z = 3
+
+        [other]
+        y = 2
+
+        [service]
+        x = 1
+        '''
+    )
+    assert parse(doc.as_string()).unwrap() == original_value
+    sorted_text = doc.as_string()
+    doc["service"].sort_keys(["child", "x"])
+    assert doc.as_string() == sorted_text
+
+
+def test_sort_keys_raises_and_keeps_text_when_order_changes_semantics() -> None:
+    content = dedent(
+        '''\
+        [service]
+        plain = 1
+
+        [service.child]
+        value = 2
+        '''
+    )
+    doc = parse(content)
+
+    with pytest.raises(TOMLKitError):
+        doc["service"].sort_keys(["child", "plain"])
+
+    assert doc.as_string() == content
+
+
+def test_sort_keys_missing_key_keeps_text_unchanged() -> None:
+    doc = parse("a = 1\n")
+
+    with pytest.raises(NonExistentKey):
+        doc.sort_keys(["missing", "a"])
+
+    assert doc.as_string() == "a = 1\n"

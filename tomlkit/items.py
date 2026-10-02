@@ -488,6 +488,9 @@ class Item:
 
     def __init__(self, trivia: Trivia) -> None:
         self._trivia = trivia
+        self._parent_container: Any | None = None
+        self._parent_key: Key | None = None
+        self.parent_item: Item | None = None
 
     @property
     def trivia(self) -> Trivia:
@@ -1822,6 +1825,38 @@ class AbstractTable(Item, _CustomDict):  # type: ignore[type-arg]
         super().setdefault(key, default)
         return self[key]
 
+    def sort_keys(
+        self: AT, key_order: Sequence[str] = (), recursive: bool = False
+    ) -> AT:
+        """Reorder keys in this table without reformatting the document."""
+        from tomlkit.container import _normalize_key_order
+        from tomlkit.container import _adopt_container
+        from tomlkit.container import _source_map
+        from tomlkit.container import _ensure_order_keys_exist
+        from tomlkit.container import _sort_container
+        from tomlkit.container import _validate_container
+
+        order = _normalize_key_order(key_order)
+        _ensure_order_keys_exist(self._value, order, recursive)
+
+        memo: dict[int, Any] = {}
+        candidate_value = copy.deepcopy(self._value, memo)
+        candidate_value.parent_item = self
+        _sort_container(candidate_value, order, recursive)
+        _validate_container(
+            candidate_value,
+            order,
+            recursive,
+            inline=isinstance(self, InlineTable),
+        )
+
+        _adopt_container(
+            self._value,
+            candidate_value,
+            _source_map(self._value, memo),
+        )
+        return self
+
     def __str__(self) -> str:
         return str(self.value)
 
@@ -2376,6 +2411,74 @@ class AoT(Item, _CustomList):  # type: ignore[type-arg]
         for child in self:
             if hasattr(child, "invalidate_display_name"):
                 child.invalidate_display_name()
+
+    def sort_keys(
+        self, key_order: Sequence[str] = (), recursive: bool = False
+    ) -> AoT:
+        """Reorder keys in every table record of this array-of-tables."""
+        from tomlkit.container import _adopt_container
+        from tomlkit.container import _ensure_order_keys_exist
+        from tomlkit.container import _normalize_key_order
+        from tomlkit.container import _source_map
+        from tomlkit.container import _sort_container
+        from tomlkit.container import _validate_container
+
+        order = _normalize_key_order(key_order)
+        for table in self._body:
+            keys = set(order).intersection(table.value._map)
+            table_order = [key for key in order if key in keys]
+            _ensure_order_keys_exist(table.value, table_order)
+
+        memo: dict[int, Any] = {}
+        candidate_owner = None
+        if self._parent_container is not None and self._parent_key is not None:
+            candidate_owner = copy.deepcopy(self._parent_container, memo)
+            candidate_aot = candidate_owner.item(self._parent_key)
+            assert isinstance(candidate_aot, AoT)
+            candidates = candidate_aot.body
+        else:
+            candidates = copy.deepcopy(self._body, memo)
+
+        table_orders = [
+            [key for key in order if key in table.value._map]
+            for table in self._body
+        ]
+        for table_order, table in zip(table_orders, candidates):
+            table.value.parent_item = table
+            _sort_container(
+                table.value,
+                table_order,
+                recursive,
+                validate_keys=False,
+                pin_trailing_blank=True,
+            )
+
+        if candidate_owner is not None:
+            assert self._parent_key is not None
+            _validate_container(candidate_owner, order, recursive, False)
+        else:
+            for table_order, table in zip(table_orders, candidates):
+                _validate_container(table.value, table_order, recursive)
+
+        if candidate_owner is not None:
+            _adopt_container(
+                self._parent_container,
+                candidate_owner,
+                _source_map(self._parent_container, memo),
+            )
+        else:
+            for table, candidate in zip(self._body, candidates):
+                _adopt_container(
+                    table.value,
+                    candidate.value,
+                    _source_map(table, memo),
+                )
+                table._trivia = candidate._trivia
+                table.name = candidate.name
+                table.display_name = candidate.display_name
+                table._is_aot_element = candidate._is_aot_element
+                table._is_super_table = candidate._is_super_table
+        return self
 
     def as_string(self) -> str:
         b = ""

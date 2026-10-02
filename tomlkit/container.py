@@ -4,6 +4,7 @@ import copy
 import math
 
 from collections.abc import Iterator
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 from typing import Any
 
@@ -15,10 +16,13 @@ from tomlkit._compat import decode
 from tomlkit._types import _CustomDict
 from tomlkit._utils import merge_dicts
 from tomlkit.exceptions import KeyAlreadyPresent
+from tomlkit.exceptions import InvalidKeyOrderError
 from tomlkit.exceptions import NonExistentKey
 from tomlkit.exceptions import TOMLKitError
 from tomlkit.items import AoT
+from tomlkit.items import Array
 from tomlkit.items import Comment
+from tomlkit.items import InlineTable
 from tomlkit.items import Item
 from tomlkit.items import Key
 from tomlkit.items import Null
@@ -30,6 +34,712 @@ from tomlkit.items import item as _item
 
 
 _NOT_SET = object()
+
+
+def _normalize_key_order(key_order: Sequence[str]) -> list[str]:
+    order = list(key_order)
+    if any(not isinstance(key, str) for key in order):
+        raise TypeError("Key order must contain strings")
+    if len(order) != len(set(order)):
+        raise ValueError("Key order must not contain duplicate keys")
+    return order
+
+
+def _parse_key_path(path: str) -> list[str]:
+    from tomlkit.parser import Parser
+
+    try:
+        key = Parser(f"{path} = 0")._parse_key_value(False)[0]
+    except TOMLKitError:
+        raise NonExistentKey(path)
+    return [part.key for part in key]
+
+
+def _first_key_part(key: Key) -> str:
+    return next(iter(key)).key
+
+
+def _contains_blank_line(item: Item) -> bool:
+    if isinstance(item, Whitespace):
+        return item.s.count("\n") >= 1
+    return item.trivia.trail.count("\n") >= 2
+
+
+def _split_trivia_run(
+    run: list[tuple[Key | None, Item]],
+) -> tuple[list[tuple[Key | None, Item]], list[tuple[Key | None, Item]]]:
+    for index, (_, item) in enumerate(run):
+        if isinstance(item, Whitespace) and _contains_blank_line(item):
+            return run[: index + 1], run[index + 1 :]
+    return [], run
+
+
+def _build_groups(
+    body: list[tuple[Key | None, Item]],
+) -> tuple[
+    list[tuple[Key | None, Item]],
+    list[dict[str, Any]],
+    list[tuple[Key | None, Item]],
+]:
+    groups: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    first_key_index = next(
+        (index for index, (key, _) in enumerate(body) if key is not None),
+        len(body),
+    )
+    header_end = first_key_index
+    leading = body[:header_end]
+
+    for index, (key, item) in enumerate(body):
+        if index < header_end:
+            continue
+        if key is None:
+            continue
+
+        run_start = 0 if current is None else current["end"]
+        run = body[run_start:index]
+        before: list[tuple[Key | None, Item]] = []
+        extracted_indent: list[tuple[Key | None, Item]] = []
+        if current is not None:
+            leading_item = item.body[0] if isinstance(item, AoT) else item
+            if isinstance(leading_item, Table):
+                indent = leading_item.trivia.indent
+                newline_count = len(indent) - len(indent.lstrip("\n"))
+                if newline_count:
+                    extracted_indent = [
+                        (None, Whitespace(indent[:newline_count]))
+                    ]
+                    leading_item.trivia.indent = indent[newline_count:]
+            after, before = _split_trivia_run(run)
+            current["after"].extend(after)
+            before = extracted_indent + before
+
+        current = {
+            "key": key,
+            "item": item,
+            "start": index,
+            "end": index + 1,
+            "before": list(before),
+            "after": [],
+        }
+        groups.append(current)
+
+    if current is None:
+        return body, [], []
+
+    final_run = body[current["end"] :]
+    after, before = _split_trivia_run(final_run)
+    current["after"].extend(after)
+    return leading, groups, before
+
+
+def _flatten_groups(
+    leading: list[tuple[Key | None, Item]],
+    groups: list[dict[str, Any]],
+    final: list[tuple[Key | None, Item]],
+) -> list[tuple[Key | None, Item]]:
+    body = list(leading)
+    for group in groups:
+        before = list(group["before"])
+        after = list(group["after"])
+        body.extend(before)
+        body.append((group["key"], group["item"]))
+        body.extend(after)
+    body.extend(final)
+    return body
+
+
+def _reposition_plain_blank_lines(groups: list[dict[str, Any]]) -> None:
+    if not groups:
+        return
+    blank_by_target: dict[int, list[tuple[Key | None, Item]]] = groups[0].get(
+        "boundary_blanks", {}
+    )
+    for index, group in enumerate(groups):
+        if index in blank_by_target:
+            group["after"].extend(blank_by_target[index])
+
+
+def _index_body(container: Container, body: list[tuple[Key | None, Item]]) -> None:
+    container._map.clear()
+    container._table_keys.clear()
+    container._out_of_order_keys.clear()
+    container._validation_cache.clear()
+
+    for index, (key, item) in enumerate(body):
+        if key is None:
+            continue
+        if key in container._map:
+            current = container._map[key]
+            indices = current if isinstance(current, tuple) else (current,)
+            container._map[key] = (*indices, index)
+            container._out_of_order_keys.add(key)
+        else:
+            container._map[key] = index
+
+        if isinstance(item, AoT):
+            item._parent_container = container
+            item._parent_key = key
+            item.parent_item = None
+
+        if isinstance(item, (Table, InlineTable)):
+            item.parent_item = container.parent_item
+
+        if item.is_table():
+            container._table_keys.append(key)
+
+
+def _sort_item(item: Item, order: list[str], recursive: bool) -> None:
+    if isinstance(item, (Table, InlineTable)):
+        item.value.parent_item = item
+        _sort_container(item.value, order, recursive, validate_keys=False)
+    elif isinstance(item, AoT):
+        for table in item.body:
+            table.value.parent_item = item
+            _sort_container(
+                table.value,
+                order,
+                recursive,
+                sort_body=True,
+                validate_keys=False,
+                pin_trailing_blank=True,
+            )
+    elif recursive and isinstance(item, Array):
+        for value in item._value:
+            if value.value is not None:
+                _sort_item(value.value, order, recursive)
+
+
+def _rendered_group_key(key: Key) -> str:
+    if not key.is_dotted():
+        return _first_key_part(key)
+    return ".".join(part.key for part in key)
+
+
+def _first_item_path(key: Key, item: Item) -> str:
+    rendered = _rendered_group_key(key)
+    if isinstance(item, Table) and key.is_dotted():
+        for child_key, child_item in item.value.body:
+            if child_key is not None:
+                suffix = _first_item_path(child_key, child_item)
+                return f"{_first_key_part(key)}.{suffix}"
+    return rendered
+
+
+def _group_rank(group: dict[str, Any], order: list[str]) -> tuple[int, int, int]:
+    rendered_key = _first_item_path(group["key"], group["item"])
+    direct_key = _first_key_part(group["key"])
+    if rendered_key in order:
+        return 0, order.index(rendered_key), group["original_index"]
+    if not group["key"].is_dotted() and direct_key in order:
+        return 0, order.index(direct_key), group["original_index"]
+    return 1, group["first_seen"], group["original_index"]
+
+
+def _first_fragment_key(table: Table) -> str | None:
+    for key, item in table.value.body:
+        if key is not None:
+            return _first_item_path(key, item)
+    return None
+
+
+def _sort_fragment_groups(
+    groups: list[dict[str, Any]],
+    logical_key: Key,
+    order: list[str],
+) -> None:
+    positions = [
+        index
+        for index, group in enumerate(groups)
+        if group["key"] == logical_key and isinstance(group["item"], Table)
+    ]
+    if len(positions) < 2:
+        return
+
+    fragments = [groups[index] for index in positions]
+    ranked = []
+    unspecified = []
+    for index, group in enumerate(fragments):
+        direct_key = _first_fragment_key(group["item"])
+        if direct_key is not None and direct_key in order:
+            ranked.append((order.index(direct_key), index, group))
+        else:
+            unspecified.append((index, group))
+
+    ordered = [group for _, _, group in sorted(ranked)]
+    ordered.extend(group for _, group in unspecified)
+    if ordered:
+        first_original = groups[positions[0]]["item"]
+        assert isinstance(first_original, Table)
+        first_ordered = ordered[0]["item"]
+        assert isinstance(first_ordered, Table)
+        first_ordered.trivia.indent = first_original.trivia.indent
+    for position, group in zip(positions, ordered):
+        groups[position] = group
+
+
+def _sort_container(
+    container: Container,
+    order: list[str],
+    recursive: bool = True,
+    sort_body: bool = True,
+    validate_keys: bool = True,
+    pin_trailing_blank: bool = False,
+) -> None:
+    leading, groups, final = _build_groups(container._body)
+
+    for group in groups:
+        group["original_index"] = group["start"]
+        if recursive:
+            _sort_item(group["item"], order, recursive)
+
+    direct_keys: list[str] = []
+    for group in groups:
+        direct_key = _first_key_part(group["key"])
+        if direct_key not in direct_keys:
+            direct_keys.append(direct_key)
+        group["first_seen"] = direct_keys.index(direct_key)
+
+    if sort_body:
+        boundary_blanks: dict[int, list[tuple[Key | None, Item]]] = {}
+        if not pin_trailing_blank and not isinstance(
+            container.parent_item, InlineTable
+        ):
+            for index, group in enumerate(groups[:-1]):
+                after = group["after"]
+                for item_index, (_, item) in enumerate(after):
+                    if isinstance(item, Whitespace) and _contains_blank_line(item):
+                        boundary_blanks[index] = after[item_index:]
+                        group["after"] = after[:item_index]
+                        break
+
+        ranked_groups = sorted(
+            enumerate(groups),
+            key=lambda entry: _group_rank(entry[1], order),
+        )
+        groups[:] = [group for _, group in ranked_groups]
+        for index, group in enumerate(groups):
+            group["sorted_index"] = index
+            group["boundary_blanks"] = boundary_blanks
+
+        if pin_trailing_blank:
+            trailing: list[tuple[Key | None, Item]] = []
+            for group in groups:
+                after = group["after"]
+                for item_index, (_, item) in enumerate(after):
+                    if isinstance(item, Whitespace) and _contains_blank_line(item):
+                        trailing.extend(after[item_index:])
+                        group["after"] = after[:item_index]
+                        break
+            groups[-1]["after"].extend(trailing)
+
+        if isinstance(container.parent_item, InlineTable):
+            for index, group in enumerate(groups):
+                group["before"] = []
+                group["after"] = (
+                    [(None, Whitespace(", "))]
+                    if index < len(groups) - 1
+                    else []
+                )
+        elif not pin_trailing_blank:
+            _reposition_plain_blank_lines(groups)
+
+        for key, index in container._map.items():
+            if isinstance(index, tuple):
+                _sort_fragment_groups(groups, key, order)
+
+    container._body = _flatten_groups(
+        leading, groups, final
+    )
+    _index_body(container, container._body)
+
+
+def _sort_proxy_container(
+    owner: Container, indices: tuple[int, ...], order: list[str], recursive: bool
+) -> None:
+    logical_key = next(
+        key for key, value in owner._map.items() if value == indices
+    )
+    leading, groups, final = _build_groups(owner._body)
+
+    fragment_groups: list[tuple[int, dict[str, Any]]] = []
+    for index, group in enumerate(groups):
+        if group["key"] == logical_key and isinstance(group["item"], Table):
+            fragment_groups.append((index, group))
+
+    for _, group in fragment_groups:
+        if recursive:
+            _sort_item(group["item"], order, recursive)
+        else:
+            group["item"].value.parent_item = group["item"]
+            _sort_container(
+                group["item"].value,
+                order,
+                False,
+                sort_body=True,
+                validate_keys=False,
+            )
+
+    positions = [index for index, _ in fragment_groups]
+
+    def trailing_blank(table: Table) -> Whitespace | None:
+        last_key_index = max(
+            (
+                index
+                for index, (key, _) in enumerate(table.value.body)
+                if key is not None
+            ),
+            default=-1,
+        )
+        for index in range(len(table.value.body) - 1, last_key_index, -1):
+            key, item = table.value.body[index]
+            if isinstance(item, Whitespace):
+                del table.value.body[index]
+                return item
+        if last_key_index >= 0:
+            last_item = table.value.body[last_key_index][1]
+            if last_item.trivia.trail.count("\n") > 1:
+                last_item.trivia.trail = last_item.trivia.trail[:-1]
+                return Whitespace("\n")
+        return None
+
+    boundary_blanks: dict[int, Whitespace] = {}
+    boundary_targets: dict[int, int] = {}
+    for position in positions:
+        boundary_position = position + 1
+        while (
+            boundary_position < len(groups)
+            and groups[boundary_position]["key"] == logical_key
+        ):
+            boundary_position += 1
+        if boundary_position >= len(groups):
+            continue
+
+        boundary_table = groups[boundary_position]["item"]
+        if not isinstance(boundary_table, Table):
+            continue
+        source_table = groups[position]["item"]
+        blank = None
+        if boundary_position not in positions and isinstance(source_table, Table):
+            blank = trailing_blank(source_table)
+        if blank is None:
+            blank = trailing_blank(boundary_table)
+        if blank is not None:
+            boundary_blanks[boundary_position] = blank
+            boundary_targets[boundary_position] = position
+
+    ranked = []
+    unspecified = []
+    for original_index, (_, group) in enumerate(fragment_groups):
+        direct_key = _first_fragment_key(group["item"])
+        if direct_key is not None and direct_key in order:
+            ranked.append((order.index(direct_key), original_index, group))
+        else:
+            unspecified.append((original_index, group))
+
+    ordered = [group for _, _, group in sorted(ranked)]
+    ordered.extend(group for _, group in unspecified)
+    original_positions = list(positions)
+    for position, group in zip(original_positions, ordered):
+        groups[position] = group
+        table = group["item"]
+        if isinstance(table, Table) and position in boundary_targets.values():
+            source_boundary = next(
+                boundary
+                for boundary, target in boundary_targets.items()
+                if target == position
+            )
+            if source_boundary not in positions:
+                table.value.body.append(
+                    (None, boundary_blanks[source_boundary])
+                )
+        elif isinstance(table, Table) and position in boundary_blanks:
+            table.trivia.indent = (
+                boundary_blanks[position].s + table.trivia.indent
+            )
+
+    owner._body = _flatten_groups(leading, groups, final)
+    _index_body(owner, owner._body)
+
+
+def _container_key_strings(container: Container) -> set[str]:
+    keys = {key.key for key in container._map}
+    for key, _ in container._body:
+        if key is not None:
+            keys.add(_rendered_group_key(key))
+    return keys
+
+
+def _item_contains_key(item: Item, parts: list[str], recursive: bool) -> bool:
+    if not parts:
+        return True
+    key = parts[0]
+    if isinstance(item, (Table, InlineTable)):
+        return _container_contains_path(item.value, parts, recursive)
+    if isinstance(item, AoT):
+        return any(
+            _container_contains_path(table.value, parts, recursive)
+            for table in item.body
+        )
+    if recursive and isinstance(item, Array):
+        return any(
+            group.value is not None
+            and _item_contains_key(group.value, parts, recursive)
+            for group in item._value
+        )
+    return False
+
+
+def _container_contains_path(
+    container: Container, parts: list[str], recursive: bool
+) -> bool:
+    key = parts[0]
+    try:
+        value = container.item(key)
+    except NonExistentKey:
+        value = None
+
+    if value is not None:
+        if len(parts) == 1:
+            return True
+        if isinstance(value, OutOfOrderTableProxy):
+            return _container_contains_path(
+                value._internal_container, parts[1:], recursive
+            )
+        if isinstance(value, Item):
+            return _item_contains_key(value, parts[1:], recursive)
+
+    if recursive:
+        return any(
+            _item_contains_key(item, parts, recursive)
+            for body_key, item in container.body
+            if body_key is not None
+        )
+    return False
+
+
+def _ensure_order_keys_exist(
+    container: Container, order: list[str], recursive: bool = False
+) -> None:
+    for key in order:
+        if key in _container_key_strings(container):
+            continue
+
+        parts = _parse_key_path(key)
+        if not _container_contains_path(container, parts, recursive):
+            raise NonExistentKey(key)
+
+
+def _invalidate_display_names(container: Container) -> None:
+    for _, item in container.body:
+        if isinstance(item, (Table, AoT)):
+            item.invalidate_display_name()
+
+
+def _assert_container_order(
+    container: Container,
+    order: list[str],
+    recursive: bool,
+    validate_keys: bool = True,
+) -> None:
+    keys: list[str] = []
+    for key, item in container.body:
+        if key is None:
+            continue
+        rendered = _first_item_path(key, item)
+        if rendered not in keys:
+            keys.append(rendered)
+
+    selected = [key for key in keys if key in order]
+    expected = [key for key in order if key in selected]
+    if selected != expected:
+        raise InvalidKeyOrderError(
+            "Requested key order cannot be represented without changing semantics"
+        )
+
+    if recursive:
+        for _, item in container.body:
+            _assert_item_order(item, order, validate_keys)
+
+
+def _assert_item_order(
+    item: Item, order: list[str], validate_keys: bool = True
+) -> None:
+    if isinstance(item, (Table, InlineTable)):
+        _assert_container_order(item.value, order, True, validate_keys)
+    elif isinstance(item, AoT):
+        for table in item.body:
+            _assert_container_order(
+                table.value, order, True, validate_keys
+            )
+    elif isinstance(item, Array):
+        for group in item._value:
+            if group.value is not None:
+                _assert_item_order(group.value, order, validate_keys)
+
+
+def _validate_container(
+    container: Container,
+    order: list[str],
+    recursive: bool,
+    validate_keys: bool = True,
+    inline: bool = False,
+) -> None:
+    from tomlkit.parser import Parser
+    from tomlkit.toml_document import TOMLDocument
+
+    validation_container = container
+    standalone = not isinstance(container, TOMLDocument)
+    if standalone:
+        validation_container = Container(True)
+        wrapper: Item
+        if inline:
+            wrapper = InlineTable(container, Trivia(), new=False)
+        else:
+            wrapper = Table(container, Trivia(), False, is_super_table=False)
+        validation_container._raw_append(SingleKey("__tomlkit_sort__"), wrapper)
+
+    _invalidate_display_names(container)
+    rendered = validation_container.as_string()
+    try:
+        reparsed = Parser(rendered).parse()
+    except TOMLKitError as exc:
+        raise InvalidKeyOrderError(str(exc)) from exc
+
+    if reparsed.unwrap() != validation_container.unwrap():
+        raise InvalidKeyOrderError("Requested key order changes the TOML value")
+    if standalone:
+        _assert_container_order(container, order, recursive, validate_keys)
+    else:
+        _assert_container_order(reparsed, order, recursive, validate_keys)
+
+
+def _keyed_entries(
+    container: Container,
+) -> dict[str, list[tuple[Key, Item]]]:
+    entries: dict[str, list[tuple[Key, Item]]] = {}
+    for key, item in container.body:
+        if key is not None:
+            entries.setdefault(key.key, []).append((key, item))
+    return entries
+
+
+def _collect_items(container: Container) -> list[Any]:
+    objects: list[Any] = [container]
+    for _, item in container.body:
+        objects.append(item)
+        if isinstance(item, (Table, InlineTable)):
+            objects.extend(_collect_items(item.value))
+        elif isinstance(item, AoT):
+            for table in item.body:
+                objects.append(table)
+                objects.extend(_collect_items(table.value))
+        elif isinstance(item, Array):
+            for group in item._value:
+                if group.value is not None:
+                    nested_items = _collect_item(group.value)
+                    objects.extend(nested_items)
+    return objects
+
+
+def _collect_item(item: Item) -> list[Any]:
+    objects: list[Any] = [item]
+    if isinstance(item, (Table, InlineTable)):
+        objects.extend(_collect_items(item.value))
+    elif isinstance(item, AoT):
+        for table in item.body:
+            objects.append(table)
+            objects.extend(_collect_items(table.value))
+    elif isinstance(item, Array):
+        for group in item._value:
+            if group.value is not None:
+                objects.extend(_collect_item(group.value))
+    return objects
+
+
+def _source_map(original: Any, memo: dict[int, Any]) -> dict[int, Item | Container]:
+    containers = (
+        _collect_items(original)
+        if isinstance(original, Container)
+        else _collect_item(original)
+    )
+    return {
+        id(memo[id(source)]): source
+        for source in containers
+        if id(source) in memo
+    }
+
+
+def _adopt_item(original: Item, candidate: Item) -> None:
+    if hasattr(candidate, "_trivia"):
+        original._trivia = candidate._trivia
+
+    if isinstance(original, (Table, InlineTable)) and isinstance(
+        candidate, (Table, InlineTable)
+    ):
+        _adopt_container(original.value, candidate.value)
+        if isinstance(original, Table) and isinstance(candidate, Table):
+            original.name = candidate.name
+            original.display_name = candidate.display_name
+            original._is_aot_element = candidate._is_aot_element
+            original._is_super_table = candidate._is_super_table
+        elif isinstance(original, InlineTable):
+            original._new = candidate._new
+    elif isinstance(original, AoT) and isinstance(candidate, AoT):
+        original._body = candidate._body
+        original._parsed = candidate._parsed
+        list.clear(original)
+        list.extend(original, candidate._body)
+        for original_table, candidate_table in zip(original.body, candidate.body):
+            _adopt_item(original_table, candidate_table)
+    elif isinstance(original, Array) and isinstance(candidate, Array):
+        original._value = candidate._value
+        original._index_map = dict(candidate._index_map)
+        original._multiline = candidate._multiline
+        list.clear(original)
+        list.extend(original, candidate)
+
+
+def _adopt_container(
+    original: Container,
+    candidate: Container,
+    source_map: dict[int, Item | Container] | None = None,
+) -> None:
+    item_by_id = {
+        id(item): (key, item)
+        for key, item in original.body
+        if key is not None
+    }
+    used: dict[str, int] = {}
+    body: list[tuple[Key | None, Item]] = []
+
+    for candidate_key, candidate_item in candidate.body:
+        if candidate_key is None:
+            body.append((None, candidate_item))
+            continue
+
+        mapped = source_map.get(id(candidate_item)) if source_map else None
+        if mapped is not None and isinstance(mapped, Item):
+            original_item = mapped
+            original_key, _ = item_by_id[id(original_item)]
+        else:
+            original_entries = _keyed_entries(original)
+            occurrence = used.get(candidate_key.key, 0)
+            used[candidate_key.key] = occurrence + 1
+            original_key, original_item = original_entries[candidate_key.key][
+                occurrence
+            ]
+        _adopt_item(original_item, candidate_item)
+        body.append((original_key, original_item))
+
+    original._body = body
+    original._parsed = candidate._parsed
+    _index_body(original, body)
+
+    dict.clear(original)
+    for key, item in body:
+        if key is not None:
+            dict.__setitem__(original, key.key, item.value)
 
 
 class Container(_CustomDict):  # type: ignore[type-arg]
@@ -53,6 +763,7 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         # out-of-order tables doesn't have to scan every key in the map;
         # stale entries are filtered by the per-key isinstance check
         self._out_of_order_keys: set[Key] = set()
+        self.parent_item: Item | None = None
 
     @property
     def body(self) -> list[tuple[Key | None, Item]]:
@@ -634,6 +1345,24 @@ class Container(_CustomDict):  # type: ignore[type-arg]
             return self._body[-1][1]
         return None
 
+    def sort_keys(
+        self,
+        key_order: Sequence[str] = (),
+        recursive: bool = False,
+        _validate_keys: bool = True,
+    ) -> Container:
+        """Reorder keys in this container without reformatting the document."""
+        order = _normalize_key_order(key_order)
+        if _validate_keys:
+            _ensure_order_keys_exist(self, order, recursive)
+
+        memo: dict[int, Any] = {}
+        candidate = copy.deepcopy(self, memo)
+        _sort_container(candidate, order, recursive)
+        _validate_container(candidate, order, recursive, _validate_keys)
+        _adopt_container(self, candidate, _source_map(self, memo))
+        return self
+
     def as_string(self) -> str:
         """Render as TOML string."""
         s = ""
@@ -1087,11 +1816,23 @@ class OutOfOrderTableProxy(_CustomDict):  # type: ignore[type-arg]
         temp_container._validate_out_of_order_table()
         return temp_container
 
-    def __init__(self, container: Container, indices: tuple[int, ...]) -> None:
+    def __init__(
+        self,
+        container: Container,
+        indices: tuple[int, ...],
+        logical_key: Key | None = None,
+    ) -> None:
         self._container = container
         self._internal_container = Container(True)
         self._tables: list[Table] = []
         self._tables_map: dict[Key, list[int]] = {}
+        self._logical_key = logical_key
+
+        if logical_key is None:
+            for key, key_indices in container._map.items():
+                if key_indices == indices:
+                    self._logical_key = key
+                    break
 
         for i in indices:
             _, _item = self._container._body[i]
@@ -1259,6 +2000,53 @@ class OutOfOrderTableProxy(_CustomDict):  # type: ignore[type-arg]
         if key not in self:
             self[key] = default
         return self[key]
+
+    def sort_keys(
+        self, key_order: Sequence[str] = (), recursive: bool = False
+    ) -> OutOfOrderTableProxy:
+        """Reorder logical keys spread across multiple table fragments."""
+        order = _normalize_key_order(key_order)
+        _ensure_order_keys_exist(
+            self._internal_container, order, recursive
+        )
+
+        assert self._logical_key is not None
+        logical_key = self._logical_key
+        memo: dict[int, Any] = {}
+        candidate_owner = copy.deepcopy(self._container, memo)
+        candidate_indices = candidate_owner._map[logical_key]
+        if not isinstance(candidate_indices, tuple):
+            candidate_indices = (candidate_indices,)
+
+        _sort_proxy_container(candidate_owner, candidate_indices, order, recursive)
+        _invalidate_display_names(candidate_owner)
+
+        from tomlkit.parser import Parser
+
+        try:
+            reparsed = Parser(candidate_owner.as_string()).parse()
+        except TOMLKitError as exc:
+            raise InvalidKeyOrderError(str(exc)) from exc
+
+        if reparsed.unwrap() != self._container.unwrap():
+            raise InvalidKeyOrderError("Requested key order changes the TOML value")
+
+        candidate_proxy = OutOfOrderTableProxy(
+            candidate_owner, candidate_indices, logical_key
+        )
+        _assert_container_order(
+            candidate_proxy._internal_container, order, recursive
+        )
+        _adopt_container(
+            self._container, candidate_owner, _source_map(self._container, memo)
+        )
+        adopted_indices = self._container._map[logical_key]
+        if not isinstance(adopted_indices, tuple):
+            adopted_indices = (adopted_indices,)
+        return OutOfOrderTableProxy(
+            self._container, adopted_indices, logical_key
+        )
+
 
 
 def ends_with_whitespace(it: Any) -> bool:
